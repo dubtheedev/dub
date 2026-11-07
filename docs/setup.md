@@ -82,7 +82,18 @@ http://localhost:8787`) or can be replayed from the App's "Recent deliveries".
 reviewers: [ryanwsnow]          # GitHub logins allowed to write `dubbed`
 base: main
 preview_origin_allowlist: [https://dubthee.dev]
+# A Reject closes the PR, as the spec says. Set false to record Rejects
+# without closing (the status still goes red).
+close_on_reject: true
+# Only tokens minted by this workflow file may upload bundles. Leave it out
+# to accept any workflow in the repo's own .github/workflows/.
+publish_workflow: review-app.yml
 ```
+
+Bundle files are served from the Worker under a sandboxing CSP; only
+images, video, JSON and plain text are shown inline, everything else (SVG,
+HTML, traces) downloads. Nothing in a bundle can run script against a
+reviewer's session.
 
 `.dub/areas.yml` maps area names to path globs (the CLI turns a diff into
 `diff.areas`):

@@ -11,8 +11,12 @@ describe('parseSimpleYaml', () => {
 
 describe('parseConfig', () => {
   it('defaults and lowercases reviewers', () => {
-    expect(parseConfig(null)).toEqual({ reviewers: [], base: 'main', preview_origin_allowlist: [] });
-    expect(parseConfig('reviewers: [@RyanWSnow]\nbase: trunk\n')).toEqual({ reviewers: ['ryanwsnow'], base: 'trunk', preview_origin_allowlist: [] });
+    expect(parseConfig(null)).toEqual({ reviewers: [], base: 'main', preview_origin_allowlist: [], close_on_reject: true, publish_workflow: null });
+    expect(parseConfig('reviewers: [@RyanWSnow]\nbase: trunk\n')).toMatchObject({ reviewers: ['ryanwsnow'], base: 'trunk', preview_origin_allowlist: [] });
+  });
+  it('reads close_on_reject and publish_workflow', () => {
+    expect(parseConfig('close_on_reject: false\npublish_workflow: .github/workflows/review-app.yml\n')).toMatchObject({ close_on_reject: false, publish_workflow: 'review-app.yml' });
+    expect(parseConfig('close_on_reject: yes\npublish_workflow: review-app.yml\n')).toMatchObject({ close_on_reject: true, publish_workflow: 'review-app.yml' });
   });
 });
 

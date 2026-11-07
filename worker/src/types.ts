@@ -61,6 +61,13 @@ export interface CriteriaChange {
   to?: string;
 }
 
+/** Artifact and spec comparison against `previous`, per criterion. `null` = nothing to compare with. */
+export interface MetaCriterion {
+  id: string;
+  spec_changed: boolean | null;
+  evidence: { path: string; artifact_changed: boolean | null }[];
+}
+
 export interface Meta {
   bundle_id: string;
   sha: string;
@@ -68,6 +75,7 @@ export interface Meta {
   head_at_intake: boolean;
   previous: { sha: string; bundle_id: string; verdict: Verdict | null; seq: number | null } | null;
   criteria_diff: CriteriaChange[];
+  criteria: MetaCriterion[];
   rubric: { base_sha: string | null; hits: string[] };
 }
 
@@ -84,6 +92,7 @@ export interface VerdictEvent {
   at: string;
   /** Set when the review was posted by the App on the reviewer's behalf. */
   on_behalf?: boolean;
+  idempotency_key?: string | null;
 }
 
 // `pending_status` is the App-credentialed pending write on a new head (seq 0).
@@ -105,6 +114,9 @@ export interface BundleRow {
   bundle_id: string;
   sha: string;
   received_at: string;
+  /** sha256 hex of the uploaded dub.json bytes; null for rows made before reserve existed. */
+  digest?: string | null;
+  complete?: boolean;
 }
 
 export interface PRState {

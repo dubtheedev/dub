@@ -1,24 +1,15 @@
 // The Dub Worker: bundle intake (OIDC), access-checked serving, verdicts,
 // webhooks, App OAuth, and the placeholder review page. The per-PR state is
 // in `do/pr.ts`.
-import type { Bundle, Criterion, Env, Meta } from './types';
+import type { Bundle, BundleCriterion, Criterion, Env, Meta } from './types';
 import { PullRequest, type FullState, type PRId } from './do/pr';
 import { AppAuth, GitHub, GitHubError, atLeast, type Permission } from './lib/github';
 import { OidcError, verifyActionsToken } from './lib/oidc';
 import { readTar } from './lib/tar';
-import { criteriaDiff, previousFor, rubricHits } from './lib/meta';
+import { artifactDiff, criteriaDiff, previousFor, rubricHits } from './lib/meta';
+import { OAUTH_COOKIE, oauthCookie, readOAuthState, signOAuthState } from './lib/oauth';
 import { parseConfig, type DubConfig } from './lib/config';
-import {
-  SESSION_COOKIE,
-  hmacHex,
-  parseCookies,
-  readCliToken,
-  readSession,
-  sessionCookie,
-  signCliToken,
-  signSession,
-  timingSafeEqual,
-} from './lib/session';
+import { SESSION_COOKIE, hmacHex, parseCookies, readCliToken, readSession, sessionCookie, signCliToken, signSession, timingSafeEqual } from './lib/session';
 import { renderReviewPage } from './page/review';
 import { renderSimple } from './page/review';
 import { esc } from './page/html';
@@ -198,26 +189,28 @@ async function authLogin(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url);
   const cli = url.searchParams.get('cli') === '1';
   const next = url.searchParams.get('next') ?? '/';
+  // The nonce lives in both the signed state and a short-lived cookie, so a
+  // state can only be redeemed by the browser that started the dance.
   const nonce = crypto.randomUUID();
-  const statePayload = JSON.stringify({ n: nonce, cli, next: next.startsWith('/') ? next : '/' });
-  const state = `${b64url(statePayload)}.${await hmacHex(env.SESSION_SECRET, new TextEncoder().encode(statePayload))}`;
+  const state = await signOAuthState(env.SESSION_SECRET, { n: nonce, cli, next: next.startsWith('/') ? next : '/' });
   const authorize = new URL('https://github.com/login/oauth/authorize');
   authorize.searchParams.set('client_id', env.GITHUB_OAUTH_CLIENT_ID);
   authorize.searchParams.set('redirect_uri', `${env.PUBLIC_URL}/auth/callback`);
   authorize.searchParams.set('state', state);
-  return new Response(null, { status: 302, headers: { location: authorize.toString() } });
+  return new Response(null, {
+    status: 302,
+    headers: { location: authorize.toString(), 'set-cookie': oauthCookie(nonce, url.protocol === 'https:') },
+  });
 }
 
 async function authCallback(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url);
   const code = url.searchParams.get('code');
-  const state = url.searchParams.get('state') ?? '';
-  const [payloadB64, sig] = state.split('.');
-  if (!code || !payloadB64 || !sig) throw new HttpError(400, 'missing code or state');
-  const payload = b64urlDecode(payloadB64);
-  const expect = await hmacHex(env.SESSION_SECRET, new TextEncoder().encode(payload));
-  if (!timingSafeEqual(sig, expect)) throw new HttpError(400, 'bad state');
-  const st = JSON.parse(payload) as { cli: boolean; next: string };
+  if (!code) throw new HttpError(400, 'missing code');
+  const st = await readOAuthState(env.SESSION_SECRET, url.searchParams.get('state'));
+  if (!st) throw new HttpError(400, 'bad state');
+  const nonce = parseCookies(req.headers.get('cookie'))[OAUTH_COOKIE];
+  if (!nonce || !timingSafeEqual(nonce, st.n)) throw new HttpError(400, 'state does not belong to this browser');
 
   const tokRes = await fetch('https://github.com/login/oauth/access_token', {
     method: 'POST',
@@ -233,13 +226,10 @@ async function authCallback(req: Request, env: Env): Promise<Response> {
   if (!tok.access_token) throw new HttpError(401, `GitHub OAuth failed: ${tok.error_description ?? tok.error ?? 'no token'}`);
   const me = await gh.viewer(tok.access_token);
   const cookie = await signSession(env.SESSION_SECRET, { login: me.login, user_token: tok.access_token });
-  return new Response(null, {
-    status: 302,
-    headers: {
-      location: st.cli ? '/auth/token' : st.next || '/',
-      'set-cookie': sessionCookie(cookie, url.protocol === 'https:'),
-    },
-  });
+  const headers = new Headers({ location: st.cli ? '/auth/token' : st.next || '/' });
+  headers.append('set-cookie', sessionCookie(cookie, url.protocol === 'https:'));
+  headers.append('set-cookie', oauthCookie('', url.protocol === 'https:', 0));
+  return new Response(null, { status: 302, headers });
 }
 
 async function authToken(req: Request, env: Env): Promise<Response> {
@@ -254,14 +244,6 @@ async function authToken(req: Request, env: Env): Promise<Response> {
     `<p>Signed in as <b>@${esc(user.login)}</b>. Paste this into <code>dub login</code>. It is valid for 30 days and is shown once.</p>
      <pre style="white-space:pre-wrap;word-break:break-all">${esc(token)}</pre>`,
   );
-}
-
-function b64url(s: string): string {
-  return btoa(unescape(encodeURIComponent(s))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-function b64urlDecode(s: string): string {
-  const b = s.replace(/-/g, '+').replace(/_/g, '/');
-  return decodeURIComponent(escape(atob(b + '='.repeat((4 - (b.length % 4)) % 4))));
 }
 
 // ---- webhooks --------------------------------------------------------------
@@ -303,9 +285,11 @@ async function intake(req: Request, env: Env): Promise<Response> {
   const dubFile = form.get('dub.json');
   const tarFile = form.get('evidence.tar');
   if (!(dubFile instanceof File)) throw new HttpError(400, 'multipart field dub.json (file) required');
+  const dubBytes = new Uint8Array(await dubFile.arrayBuffer());
+  const digest = await sha256Hex(dubBytes);
   let bundle: Bundle;
   try {
-    bundle = JSON.parse(await dubFile.text()) as Bundle;
+    bundle = JSON.parse(new TextDecoder().decode(dubBytes)) as Bundle;
   } catch {
     throw new HttpError(400, 'dub.json is not JSON');
   }
@@ -323,13 +307,27 @@ async function intake(req: Request, env: Env): Promise<Response> {
     if (!prs.some((p) => p.number === bundle.pr)) throw new HttpError(422, `sha ${bundle.sha} is not part of PR #${bundle.pr}`);
   }
 
+  // The publishing workflow must be the repo's own, and the configured one if
+  // `.dub/config.yml` names it (finding 9).
+  const { config, base_sha, rubric } = await repoConfig(env, id);
+  if (config.publish_workflow && config.publish_workflow.toLowerCase() !== claims.workflow_file.toLowerCase()) {
+    throw new HttpError(403, `bundles may only be published by .github/workflows/${config.publish_workflow}, not ${claims.workflow_file}`);
+  }
+
   const stub = doFor(env, id);
   // Keep the DO's picture of the PR fresh even if a webhook was missed.
   await stub.recordWebhook(id, { action: 'sync', head_sha: pr.head.sha, author: pr.user.login, open: pr.state === 'open' });
-  const state = await stub.state(id);
 
   const pre = prefix(id, bundle.sha, bundle.bundle_id);
   const received_at = new Date().toISOString();
+  const pageUrl = `${env.PUBLIC_URL}/r/${owner}/${repo}/pull/${bundle.pr}?sha=${bundle.sha}`;
+
+  // Claim the id before any R2 write (finding 4): a retry with identical
+  // bytes is idempotent, a different payload under the same id is refused.
+  const reserved = await stub.reserveBundle(id, { bundle_id: bundle.bundle_id, sha: bundle.sha, digest, received_at });
+  if ('conflict' in reserved) throw new HttpError(409, `bundle_id ${bundle.bundle_id} already exists with different content`);
+  if (reserved.existing && reserved.complete) return json({ bundle_id: bundle.bundle_id, url: pageUrl, existing: true }, 200);
+  const state = await stub.state(id);
 
   // Evidence files.
   if (tarFile instanceof File) {
@@ -342,14 +340,24 @@ async function intake(req: Request, env: Env): Promise<Response> {
   }
   await env.BUNDLES.put(`${pre}/dub.json`, JSON.stringify(bundle), { httpMetadata: { contentType: 'application/json' } });
 
-  // meta.json: previous, criteria_diff, rubric hits (contract decision 2).
-  const previous = previousFor(state.bundles, state.verdicts, bundle.sha, received_at);
+  // meta.json: previous, criteria_diff, artifact/spec comparison, rubric hits
+  // (contract decision 2). Only complete bundles count as `previous`.
+  const previous = previousFor(
+    state.bundles.filter((b) => b.complete !== false),
+    state.verdicts,
+    bundle.sha,
+    received_at,
+  );
   let prevCriteria: Criterion[] | null = null;
+  let prevBundleCriteria: BundleCriterion[] | null = null;
   if (previous) {
     const prevObj = await env.BUNDLES.get(`${prefix(id, previous.sha, previous.bundle_id)}/dub.json`);
-    if (prevObj) prevCriteria = ((await prevObj.json()) as Bundle).brief?.criteria ?? null;
+    if (prevObj) {
+      const prevBundle = (await prevObj.json()) as Bundle;
+      prevCriteria = prevBundle.brief?.criteria ?? null;
+      prevBundleCriteria = prevBundle.criteria ?? null;
+    }
   }
-  const { base_sha, rubric } = await repoConfig(env, id);
   const meta: Meta = {
     bundle_id: bundle.bundle_id,
     sha: bundle.sha,
@@ -357,6 +365,7 @@ async function intake(req: Request, env: Env): Promise<Response> {
     head_at_intake: pr.head.sha === bundle.sha,
     previous,
     criteria_diff: criteriaDiff(prevCriteria, bundle.brief.criteria),
+    criteria: artifactDiff(prevBundleCriteria, bundle.criteria),
     rubric: { base_sha, hits: rubric ? rubricHits(rubric, bundle.diff?.areas) : [] },
   };
   await env.BUNDLES.put(`${pre}/meta.json`, JSON.stringify(meta), { httpMetadata: { contentType: 'application/json' } });
@@ -368,7 +377,12 @@ async function intake(req: Request, env: Env): Promise<Response> {
     criteria: bundle.criteria.map((c) => ({ id: c.id, status: c.status })),
   });
 
-  return json({ bundle_id: bundle.bundle_id, url: `${env.PUBLIC_URL}/r/${owner}/${repo}/pull/${bundle.pr}?sha=${bundle.sha}` }, 201);
+  return json({ bundle_id: bundle.bundle_id, url: pageUrl }, 201);
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const h = await crypto.subtle.digest('SHA-256', bytes as BufferSource);
+  return [...new Uint8Array(h)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 function validateBundle(b: Bundle): void {
@@ -397,26 +411,43 @@ function validateBundle(b: Bundle): void {
   }
 }
 
+/**
+ * Only these are ever served inline, and even then under a sandboxing CSP.
+ * Bundle files are uploaded by CI from agent-written specs, so an SVG or an
+ * HTML page in a bundle could otherwise run script against the reviewer's
+ * session (finding 1). Everything else downloads as an attachment.
+ */
+const INLINE_TYPES: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  webm: 'video/webm',
+  mp4: 'video/mp4',
+  json: 'application/json',
+  txt: 'text/plain; charset=utf-8',
+};
+
+export const BUNDLE_FILE_CSP = "sandbox; default-src 'none'";
+
 function contentType(name: string): string {
   const ext = name.slice(name.lastIndexOf('.') + 1).toLowerCase();
-  return (
-    {
-      png: 'image/png',
-      jpg: 'image/jpeg',
-      jpeg: 'image/jpeg',
-      gif: 'image/gif',
-      webp: 'image/webp',
-      svg: 'image/svg+xml',
-      webm: 'video/webm',
-      mp4: 'video/mp4',
-      json: 'application/json',
-      zip: 'application/zip',
-      txt: 'text/plain; charset=utf-8',
-      md: 'text/markdown; charset=utf-8',
-      ts: 'text/plain; charset=utf-8',
-      html: 'text/html; charset=utf-8',
-    }[ext] ?? 'application/octet-stream'
-  );
+  return INLINE_TYPES[ext] ?? 'application/octet-stream';
+}
+
+export function servingHeaders(name: string): Record<string, string> {
+  const ext = name.slice(name.lastIndexOf('.') + 1).toLowerCase();
+  const inline = INLINE_TYPES[ext];
+  const base = name.slice(name.lastIndexOf('/') + 1).replace(/[^\w.-]/g, '_');
+  return {
+    'content-security-policy': BUNDLE_FILE_CSP,
+    'x-content-type-options': 'nosniff',
+    'cache-control': 'private, max-age=3600',
+    ...(inline
+      ? { 'content-type': inline, 'content-disposition': `inline; filename="${base}"` }
+      : { 'content-type': 'application/octet-stream', 'content-disposition': `attachment; filename="${base}"` }),
+  };
 }
 
 // ---- serving ---------------------------------------------------------------
@@ -428,14 +459,14 @@ async function loadBundle(env: Env, id: PRId, sha: string, bundleId: string): Pr
   const bundle = (await b.json()) as Bundle;
   const meta: Meta = m
     ? ((await m.json()) as Meta)
-    : { bundle_id: bundleId, sha, received_at: '', head_at_intake: false, previous: null, criteria_diff: [], rubric: { base_sha: null, hits: [] } };
+    : { bundle_id: bundleId, sha, received_at: '', head_at_intake: false, previous: null, criteria_diff: [], criteria: [], rubric: { base_sha: null, hits: [] } };
   return { bundle, meta };
 }
 
 function pickBundle(state: FullState, sha: string | null): { sha: string; bundle_id: string; count: number } | null {
   const want = sha ?? state.pr.head_sha ?? state.bundles[0]?.sha ?? null;
   if (!want) return null;
-  const forSha = state.bundles.filter((b) => b.sha === want || (sha && b.sha.startsWith(sha)));
+  const forSha = state.bundles.filter((b) => b.complete !== false && (b.sha === want || (sha && b.sha.startsWith(sha))));
   if (!forSha.length) return null;
   const newest = forSha[0]!;
   return { sha: newest.sha, bundle_id: newest.bundle_id, count: forSha.length };
@@ -509,12 +540,10 @@ async function bundleFile(req: Request, env: Env, id: PRId, sha: string, bundleI
   if (path.split('/').some((s) => s === '..')) throw new HttpError(400, 'bad path');
   const obj = await env.BUNDLES.get(`${prefix(id, sha, bundleId)}/${path}`);
   if (!obj) return json({ error: 'not found' }, 404);
-  const headers = new Headers();
-  obj.writeHttpMetadata(headers);
+  // The stored content type is deliberately ignored: what a file may do in
+  // the browser is decided here, from its name, never from the upload.
+  const headers = new Headers(servingHeaders(path));
   headers.set('etag', obj.httpEtag);
-  headers.set('cache-control', 'private, max-age=3600');
-  headers.set('x-content-type-options', 'nosniff');
-  if (!headers.get('content-type')) headers.set('content-type', contentType(path));
   return new Response(obj.body, { headers });
 }
 
@@ -531,6 +560,7 @@ interface VerdictBody {
   suggest_rule?: boolean;
   used?: string[];
   because?: string[];
+  idempotency_key?: string;
 }
 
 async function submitVerdict(req: Request, env: Env): Promise<Response> {
@@ -540,6 +570,10 @@ async function submitVerdict(req: Request, env: Env): Promise<Response> {
   if (!body) throw new HttpError(400, 'JSON body required');
   for (const k of ['owner', 'repo', 'sha', 'bundle_id', 'verdict'] as const) if (!body[k]) throw new HttpError(400, `${k} required`);
   if (!['dub', 'revise', 'reject'].includes(body.verdict)) throw new HttpError(400, 'verdict must be dub, revise or reject');
+  // The page always sends one (a double-click must not record two verdicts);
+  // the API may omit it.
+  if (body.idempotency_key !== undefined && !/^[0-9a-f-]{36}$/i.test(body.idempotency_key)) throw new HttpError(400, 'idempotency_key must be a UUID');
+  if (user.via === 'cookie' && !body.idempotency_key) throw new HttpError(400, 'idempotency_key required');
   const id: PRId = { owner: body.owner, repo: body.repo, number: Number(body.pr) };
 
   // Authority: write access, on the reviewer list, and never the PR author.
@@ -567,9 +601,11 @@ async function submitVerdict(req: Request, env: Env): Promise<Response> {
     used: sanitiseList(body.used),
     because: sanitiseList(body.because),
     user_token: user.user_token,
+    idempotency_key: body.idempotency_key ?? null,
+    close_on_reject: config.close_on_reject,
   });
   if ('error' in result) throw new HttpError(422, result.error);
-  return json(result, 201);
+  return json(result, result.replayed ? 200 : 201);
 }
 
 function sanitiseList(v: unknown): string[] {

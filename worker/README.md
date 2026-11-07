@@ -14,6 +14,7 @@ src/lib/github.ts   App JWT, installation tokens, REST helpers
 src/lib/oidc.ts     GitHub Actions OIDC verification
 src/lib/tar.ts      minimal ustar reader for evidence.tar
 src/lib/session.ts  signed cookie sessions and CLI tokens
+src/lib/oauth.ts    signed OAuth state bound to a nonce cookie
 src/page/           the placeholder review page (Ryan's replaces it)
 ```
 

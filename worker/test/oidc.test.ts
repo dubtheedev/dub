@@ -12,18 +12,26 @@ async function setup() {
   return { keys, sign };
 }
 
-const good = { repository: 'deeptreecorp/missive', event_name: 'pull_request', ref: 'refs/pull/87/merge', sha: 'deadbeef', run_id: '1', workflow: 'Review app' };
+const good = { repository: 'deeptreecorp/missive', event_name: 'pull_request', ref: 'refs/pull/87/merge', sha: 'deadbeef', run_id: '1', workflow: 'Review app', job_workflow_ref: 'deeptreecorp/missive/.github/workflows/review-app.yml@refs/pull/87/merge' };
 
 describe('verifyActionsToken', () => {
   it('accepts a pull_request token and extracts the PR number', async () => {
     const { keys, sign } = await setup();
     const claims = await verifyActionsToken(await sign(good), 'dubthee.dev', keys);
-    expect(claims).toMatchObject({ repository: 'deeptreecorp/missive', pr: 87, sha: 'deadbeef' });
+    expect(claims).toMatchObject({ repository: 'deeptreecorp/missive', pr: 87, sha: 'deadbeef', workflow_file: 'review-app.yml' });
   });
   it('rejects the wrong audience, a push event, and a branch ref', async () => {
     const { keys, sign } = await setup();
     await expect(verifyActionsToken(await sign(good, 'other'), 'dubthee.dev', keys)).rejects.toThrow(/invalid OIDC/);
     await expect(verifyActionsToken(await sign({ ...good, event_name: 'push' }), 'dubthee.dev', keys)).rejects.toThrow(/pull_request/);
     await expect(verifyActionsToken(await sign({ ...good, ref: 'refs/heads/main' }), 'dubthee.dev', keys)).rejects.toThrow(/refs\/pull/);
+  });
+
+  it('requires the minting workflow to live in the repository itself', async () => {
+    const { keys, sign } = await setup();
+    await expect(verifyActionsToken(await sign({ ...good, job_workflow_ref: 'someone/else/.github/workflows/review-app.yml@refs/heads/main' }), 'dubthee.dev', keys)).rejects.toThrow(/job_workflow_ref/);
+    await expect(verifyActionsToken(await sign({ ...good, job_workflow_ref: undefined }), 'dubthee.dev', keys)).rejects.toThrow(/job_workflow_ref/);
+    const ok = await verifyActionsToken(await sign({ ...good, job_workflow_ref: 'DeepTreeCorp/Missive/.github/workflows/ci.yml@refs/pull/87/merge' }), 'dubthee.dev', keys);
+    expect(ok.workflow_file).toBe('ci.yml');
   });
 });

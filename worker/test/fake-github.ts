@@ -10,7 +10,8 @@ export interface Call {
   body: unknown;
 }
 
-type Handler = (call: Call, url: URL) => { status?: number; body?: unknown } | Response;
+type Reply = { status?: number; body?: unknown } | Response;
+type Handler = (call: Call, url: URL) => Reply | Promise<Reply>;
 
 export class FakeGitHub {
   calls: Call[] = [];
@@ -35,6 +36,7 @@ export class FakeGitHub {
     this.on('GET /repos/o/r/contents/.dub/rubric.md', () => ({ body: { encoding: 'base64', sha: 'r', content: btoa('## Plain tone\nScope: email\n\n## Empty states everywhere\n') } }));
     this.on('GET /repos/o/r/branches/main', () => ({ body: { commit: { sha: 'base-sha' } } }));
     this.on('GET /user', () => ({ body: { login: 'ryan', id: 1 } }));
+    this.on('POST /login/oauth/access_token', () => ({ body: { access_token: 'gho_fresh', token_type: 'bearer' } }));
   }
 
   on(route: string, h: Handler): void {
@@ -65,7 +67,7 @@ export class FakeGitHub {
       this.calls.push(call);
       const h = this.match(call.method, url.pathname);
       if (!h) return Response.json({ message: `fake github: no route for ${call.method} ${url.pathname}` }, { status: 404 });
-      const out = h(call, url);
+      const out = await h(call, url);
       if (out instanceof Response) return out;
       return Response.json(out.body ?? {}, { status: out.status ?? 200 });
     }) as typeof fetch;

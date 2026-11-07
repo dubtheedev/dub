@@ -10,6 +10,10 @@ export interface DubConfig {
   reviewers: string[];
   base: string;
   preview_origin_allowlist: string[];
+  /** A Reject closes the PR (spec). `close_on_reject: false` turns that off per repo. */
+  close_on_reject: boolean;
+  /** When set, only OIDC tokens minted by this workflow file may upload bundles. */
+  publish_workflow: string | null;
 }
 
 export type Areas = Record<string, string[]>;
@@ -57,10 +61,14 @@ export function parseConfig(text: string | null | undefined): DubConfig {
   const y = text ? parseSimpleYaml(text) : {};
   const list = (v: string | string[] | undefined): string[] =>
     v === undefined ? [] : Array.isArray(v) ? v : [v];
+  const bool = (v: string | string[] | undefined, dflt: boolean): boolean =>
+    typeof v === 'string' ? !['false', 'no', 'off', '0'].includes(v.toLowerCase()) : dflt;
   return {
     reviewers: list(y.reviewers).map((r) => r.replace(/^@/, '').toLowerCase()),
     base: typeof y.base === 'string' && y.base ? y.base : 'main',
     preview_origin_allowlist: list(y.preview_origin_allowlist),
+    close_on_reject: bool(y.close_on_reject, true),
+    publish_workflow: typeof y.publish_workflow === 'string' && y.publish_workflow ? y.publish_workflow.replace(/^\.github\/workflows\//, '') : null,
   };
 }
 

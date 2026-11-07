@@ -1,5 +1,5 @@
 // Computed by the Worker at intake (contract decision 2) and stored in meta.json.
-import type { BundleRow, CriteriaChange, Criterion, VerdictEvent } from '../types';
+import type { BundleCriterion, BundleRow, CriteriaChange, Criterion, MetaCriterion, VerdictEvent } from '../types';
 
 export function criteriaDiff(prev: Criterion[] | null | undefined, next: Criterion[]): CriteriaChange[] {
   if (!prev) return [];
@@ -139,4 +139,33 @@ export function rubricHits(markdown: string, areas: string[] | undefined | null)
     if (r.scope.some((s) => wanted.has(s.toLowerCase()))) hits.push(r.rule);
   }
   return hits;
+}
+
+/**
+ * Artifact and spec comparison against the previous bundle, kept as separate
+ * facts from the criterion-text diff. `null` where the previous bundle has
+ * nothing at that id/path to compare with.
+ */
+export function artifactDiff(prev: BundleCriterion[] | null | undefined, next: BundleCriterion[]): MetaCriterion[] {
+  const prevById = new Map((prev ?? []).map((c) => [c.id, c]));
+  return next.map((c) => {
+    const p = prevById.get(c.id);
+    const prevHashes = new Map((p?.evidence ?? []).map((e) => [e.path, e.hash ?? null]));
+    const evidence = (c.evidence ?? []).map((e) => {
+      if (!p || !prevHashes.has(e.path)) return { path: e.path, artifact_changed: null };
+      const before = prevHashes.get(e.path) ?? null;
+      const after = e.hash ?? null;
+      return { path: e.path, artifact_changed: before === null || after === null ? null : before !== after };
+    });
+    let spec_changed: boolean | null = null;
+    if (p && p.spec?.files && c.spec?.files) spec_changed = fingerprint(p.spec.files) !== fingerprint(c.spec.files);
+    return { id: c.id, spec_changed, evidence };
+  });
+}
+
+function fingerprint(files: { path: string; sha256: string }[]): string {
+  return files
+    .map((f) => `${f.path}:${f.sha256}`)
+    .sort()
+    .join('\n');
 }

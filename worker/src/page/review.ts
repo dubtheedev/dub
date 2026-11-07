@@ -68,6 +68,9 @@ export function renderReviewPage(d: ReviewPageData): string {
   const edited = m.criteria_diff.map((c) => c.id);
   const crit = b.criteria;
   const briefCriteria = new Map(b.brief.criteria.map((c) => [c.id, c]));
+  // Change tracking comes from meta.json (computed at intake against
+  // `previous`), never from what the bundle says about itself.
+  const metaCriteria = new Map((m.criteria ?? []).map((c) => [c.id, c]));
 
   const banners: string[] = [];
   banners.push(`<div class="banner" id="preview-banner" hidden></div>`);
@@ -93,12 +96,15 @@ export function renderReviewPage(d: ReviewPageData): string {
   const criteriaHtml = crit
     .map((c) => {
       const bc = briefCriteria.get(c.id);
+      const mc = metaCriteria.get(c.id);
+      const artifactChanged = new Map((mc?.evidence ?? []).map((e) => [e.path, e.artifact_changed]));
       const statusLabel =
         c.status === 'pass' ? 'Assertions passed' : c.status === 'fail' ? `Assertion failed${c.error ? ': ' + c.error : ''}` : c.status === 'error' ? `Couldn't complete${c.error ? ': ' + c.error : ''}` : 'No automated evidence';
       const ev = (c.evidence ?? [])
         .map((e) => {
           const url = `${d.bundle_base}/${e.path}`;
-          const flags = [e.role === 'supporting' ? 'supporting' : '', e.artifact_changed ? 'artifact changed' : ''].filter(Boolean).join(' · ');
+          const changed = artifactChanged.get(e.path);
+          const flags = [e.role === 'supporting' ? 'supporting' : '', changed === true ? 'artifact changed' : changed === false ? 'identical to previous' : ''].filter(Boolean).join(' · ');
           let body = `<a href="${esc(url)}">${esc(e.path)}</a>`;
           if (e.type === 'image') body = `<a href="${esc(url)}"><img src="${esc(url)}" alt="${esc(e.path)}" loading="lazy"></a>`;
           else if (e.type === 'video') body = `<video src="${esc(url)}" controls preload="metadata"></video>`;
@@ -106,7 +112,7 @@ export function renderReviewPage(d: ReviewPageData): string {
         })
         .join('');
       return `<div class="card" id="c-${esc(c.id)}">
-  <h3><code>${esc(c.id)}</code> ${esc(bc?.text ?? '')} <span class="kind">${esc(c.kind)}</span>${edited.includes(c.id) ? '<span class="flag">✎ criterion edited</span>' : ''}${c.spec?.changed ? '<span class="flag">spec changed</span>' : ''}</h3>
+  <h3><code>${esc(c.id)}</code> ${esc(bc?.text ?? '')} <span class="kind">${esc(c.kind)}</span>${edited.includes(c.id) ? '<span class="flag">✎ criterion edited</span>' : ''}${mc?.spec_changed ? '<span class="flag">spec changed</span>' : ''}</h3>
   <div class="status ${esc(c.status)}">${c.status === 'pass' ? '✓' : c.status === 'fail' ? '✗' : c.status === 'error' ? '⚠' : '·'} ${esc(statusLabel)}</div>
   ${c.assertions?.length ? `<details><summary>${c.assertions.length} assertion${c.assertions.length === 1 ? '' : 's'}</summary><ul>${c.assertions.map((a) => `<li><code>${esc(a)}</code></li>`).join('')}</ul></details>` : ''}
   ${c.spec?.source ? `<details><summary>spec${c.spec.files?.length ? ` (${c.spec.files.length} file${c.spec.files.length === 1 ? '' : 's'})` : ''}${c.spec.external_imports?.length ? ' · imports ' + esc(c.spec.external_imports.join(', ')) : ''}</summary><pre>${esc(c.spec.source)}</pre></details>` : ''}
@@ -220,11 +226,15 @@ const S = ${jsonForScript(pageState)};
   const form = document.getElementById('verdict');
   const result = document.getElementById('result');
   if (!S.can_review) return;
+  // One key per submission: a retry of the same click replays, a new
+  // decision after a successful one gets a new key.
+  let key = crypto.randomUUID();
   for (const btn of form.querySelectorAll('button[data-verdict]')) {
     btn.addEventListener('click', async () => {
       const vals = (n) => Array.from(form.querySelectorAll('input[name="' + n + '"]:checked')).map((i) => i.value);
       const body = {
         owner: S.owner, repo: S.repo, pr: S.pr, sha: S.sha, bundle_id: S.bundle_id,
+        idempotency_key: key,
         verdict: btn.dataset.verdict,
         note: form.note.value,
         suggest_rule: form.suggest_rule.checked,
@@ -240,6 +250,7 @@ const S = ${jsonForScript(pageState)};
         if (j.historical) msg += ' The PR has moved on to ' + j.head_sha.slice(0, 7) + ', which has no verdict yet.';
         if (j.review === 'on_behalf_pending') msg += ' Your GitHub token could not post the review; Dub will post it on your behalf.';
         result.textContent = msg;
+        key = crypto.randomUUID();
       } catch (e) {
         result.textContent = 'Failed: ' + e.message;
         for (const b of form.querySelectorAll('button')) b.disabled = false;

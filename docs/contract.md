@@ -27,6 +27,19 @@ reconciled. When this file and the spec disagree, this file wins.
 
 The Missive workflow already has a workflow-level concurrency group; it stays.
 
+### Added after the Worker code review
+
+| # | Decision |
+|---|---|
+| 17 | **Bundle files are never active content.** The Worker serves every bundle file with `content-security-policy: sandbox; default-src 'none'` and `x-content-type-options: nosniff`. Only `png jpg jpeg gif webp webm mp4 json txt` are served inline; everything else (SVG and HTML included) is `content-disposition: attachment` as `application/octet-stream`. Intake keeps all files; serving decides. |
+| 18 | **A `bundle_id` is immutable once seen.** Intake reserves the id in the DO with the sha256 of the uploaded `dub.json` before any R2 write. Same id + same digest is an idempotent retry (`200 {existing: true}`, R2 writes skipped if the first upload completed); same id + different digest is `409`. |
+| 19 | **A verdict and all of its delivery intents are committed in one synchronous block** (`review`, `status`, `close` for a Reject, `sticky`). The human-credentialed review is attempted synchronously afterwards (3 tries); if that never completes, the reconciler posts it on the reviewer's behalf after a 60s grace period. |
+| 20 | **The reconciler is serialised** per PR, and a `status` write re-checks the effective verdict after it lands, re-arming the effective seq if a newer verdict arrived while the request was in flight. |
+| 21 | **Close asks GitHub first.** Before closing, the DO fetches the PR, requires `open` and `head.sha` equal to the verdict's SHA, and updates its stored row. `close_on_reject: false` in `.dub/config.yml` disables the close (default true). |
+| 22 | **OAuth state is bound to the browser** by a `dub_oauth` nonce cookie (`Path=/auth`, 10 minutes) that must match the signed state at the callback. |
+| 23 | **Verdict submissions carry an `idempotency_key`** (UUID per form submission, regenerated after a success). Required from the page (cookie sessions), optional from the API. A replay returns the original result with `replayed: true` and records no new event. |
+| 24 | **The publishing workflow is enforced.** The OIDC `job_workflow_ref` must start with `<repository>/.github/workflows/`; if `.dub/config.yml` sets `publish_workflow: review-app.yml`, the file name must match. |
+
 ## Layout of this repo
 
 ```
@@ -100,20 +113,22 @@ As in the spec, with these clarifications:
 { "bundle_id": "…", "sha": "…", "received_at": "…", "head_at_intake": true,
   "previous": { "sha": "…", "bundle_id": "…", "verdict": "revise", "seq": 3 } | null,
   "criteria_diff": [ { "id": "ac-2", "change": "added|removed|edited", "from": "…", "to": "…" } ],
+  "criteria": [ { "id": "ac-1", "spec_changed": false,
+                  "evidence": [ { "path": "ac-1/list.png", "artifact_changed": true } ] } ],
   "rubric": { "base_sha": "…", "hits": ["…"] } }
 ```
 
-`previous` is the newest bundle of the most recent *earlier* SHA that has a verdict, else the newest earlier bundle, else null. `criteria_diff` compares `brief.criteria` by id against that bundle. `rubric.hits` are the rules in the base branch's `.dub/rubric.md` whose scope intersects `diff.areas`.
+`previous` is the newest *complete* bundle of the most recent *earlier* SHA that has a verdict, else the newest earlier bundle, else null. `criteria_diff` compares `brief.criteria` by id against that bundle. `criteria[]` compares evidence hashes per path and `spec.files` fingerprints per criterion against `previous`; `null` means the previous bundle had nothing at that id/path. **The page shows "artifact changed" and "spec changed" from `meta.json`, never from `dub.json`.** `rubric.hits` are the rules in the base branch's `.dub/rubric.md` whose scope intersects `diff.areas`.
 
 ## Worker API
 
 | Method, path | Auth | Does |
 |---|---|---|
-| `POST /api/bundles` | Actions OIDC bearer (`aud=dubthee.dev`) | Body: multipart `dub.json` + `evidence.tar`. Checks `repository`, `event_name=pull_request`, `ref=refs/pull/<n>/merge`, and that `sha` belongs to PR `<n>`. Stores to R2 `<owner>/<repo>/<n>/<sha>/<bundle_id>/`, writes `meta.json`, sets `dubbed: pending` on `sha` if that SHA has no verdict. Returns `{bundle_id, url}`. |
+| `POST /api/bundles` | Actions OIDC bearer (`aud=dubthee.dev`) | Body: multipart `dub.json` + `evidence.tar`. Checks `repository`, `event_name=pull_request`, `ref=refs/pull/<n>/merge`, `job_workflow_ref` (decision 24), and that `sha` belongs to PR `<n>`. Reserves `bundle_id` (decision 18), stores to R2 `<owner>/<repo>/<n>/<sha>/<bundle_id>/`, writes `meta.json`, sets `dubbed: pending` on `sha` if that SHA has no verdict. `201 {bundle_id, url}`; `200 {…, existing: true}` on an identical retry; `409` on a different payload under a known id. |
 | `GET /r/:owner/:repo/pull/:n` | App OAuth session | Review page (newest bundle for head, or `?sha=`). |
 | `GET /api/prs/:owner/:repo/:n` | session, repo read | `{head_sha, bundles:[…], verdicts:[…], deliveries:[…], reopen_seq}` |
-| `GET /api/bundles/:owner/:repo/:n/:sha/:bundle_id/*` | session, repo read | Bundle files from R2. |
-| `POST /api/verdicts` | session, reviewer | `{owner, repo, pr, sha, bundle_id, verdict: dub|revise|reject, note, suggest_rule, used: [...], because: [...]}` → appends event, runs effects, returns effective state. |
+| `GET /api/bundles/:owner/:repo/:n/:sha/:bundle_id/*` | session, repo read | Bundle files from R2, sandboxed (decision 17). |
+| `POST /api/verdicts` | session, reviewer | `{owner, repo, pr, sha, bundle_id, verdict: dub|revise|reject, note, suggest_rule, used: [...], because: [...], idempotency_key}` → appends event, runs effects, returns effective state (`201`; `200` with `replayed: true` on a replay). |
 | `POST /api/prs` | session (`dub pr`) | `{owner, repo, head, base, title, body}` → PR created by the App. Returns `{number, url}`. |
 | `POST /webhooks/github` | HMAC | `pull_request` `opened|synchronize|reopened|closed`. |
 | `GET /auth/login`, `/auth/callback`, `GET /auth/token` | — | App user-to-server OAuth; `/auth/token` issues a CLI token for the signed-in user. |
@@ -122,9 +137,9 @@ Status context: `dubbed`. States: `pending` (bundle awaited or awaiting verdict)
 
 ## Durable Object (one per `owner/repo/n`)
 
-Tables: `verdicts(seq PK, sha, bundle_id, reviewer, verdict, reason, note, used, because, at)`, `deliveries(seq, effect, state pending|done|superseded|failed, attempts, next_at, gh_id, last_error)`, `bundles(bundle_id PK, sha, received_at)`, `pr(head_sha, open, reopen_seq, closed_at)`.
+Tables: `verdicts(seq PK, sha, bundle_id, reviewer, verdict, reason, note, used, because, at, on_behalf, idempotency_key UNIQUE, result)`, `deliveries(seq, effect, sha, state pending|done|superseded|failed, attempts, next_at, first_at, gh_id, last_error)`, `bundles(bundle_id PK, sha, received_at, criteria, digest, complete)`, `pr(head_sha, author, open, reopen_seq, closed_at, sticky_comment_id)`.
 
-Effective verdict for a SHA = highest `seq` for that SHA. Effects per event: `review` (human, sync), `status` (App, effective only), `close` (App, reject only, eligibility re-checked at run), `sticky` (App, head only). Alarm: next `min(next_at)` among pending.
+Effective verdict for a SHA = highest `seq` for that SHA. Effects per event: `review` (human, sync, App fallback on behalf), `status` (App, effective only, re-checked after the write), `close` (App, reject only, eligibility re-checked at run and against a fresh `getPR`), `sticky` (App, head only). `pending_status` (seq 0) is the App-credentialed pending write on a new head. Alarm: next `min(next_at)` among pending; one reconciler pass runs at a time.
 
 ## GitHub App
 
@@ -136,4 +151,6 @@ Permissions: Pull requests R/W, Commit statuses R/W, Contents R (rubric, PR crea
 reviewers: [ryanwsnow]      # GitHub logins allowed to write dubbed
 base: main
 preview_origin_allowlist: [https://dubthee.dev]
+close_on_reject: true       # a Reject closes the PR (default); false records it only
+publish_workflow: review-app.yml   # optional: only this workflow may upload bundles
 ```

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { env, runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
-import type { PullRequest, SubmitResult } from '../src/do/pr';
+import { AbortAfterCommit, type PullRequest, type SubmitResult } from '../src/do/pr';
 
 const ok = (r: SubmitResult | { error: string }): SubmitResult => {
   if ('error' in r) throw new Error(r.error);
@@ -226,5 +226,136 @@ describe('PullRequest DO', () => {
     expect(gh.of('POST', `/repos/o/r/statuses/${SHA_A}`)).toHaveLength(0);
     const patch = gh.of('PATCH', '/repos/o/r/issues/comments/700');
     expect(String((patch[patch.length - 1]!.body as { body: string }).body)).toContain('A newer capture exists');
+  });
+
+  // ---- review findings ----------------------------------------------------
+
+  it('serialises the reconciler: a Dub it and a Revise submitted together end with the Revise on GitHub', async () => {
+    const order: string[] = [];
+    gh.on('POST /repos/o/r/statuses/*', async (c) => {
+      const state = (c.body as { state: string }).state;
+      order.push('start:' + state);
+      await new Promise((r) => setTimeout(r, state === 'success' ? 80 : 5));
+      order.push('end:' + state);
+      return { status: 201, body: { id: 1 } };
+    });
+    const [a, b] = await Promise.all([stub.submitVerdict(ID, verdict({ verdict: 'dub' })), stub.submitVerdict(ID, verdict({ verdict: 'revise' }))]);
+    expect(ok(a).seq).toBe(1);
+    expect(ok(b).seq).toBe(2);
+    // Whatever interleaving happened, the last write that finished is the Revise.
+    const ends = order.filter((o) => o.startsWith('end:'));
+    expect(ends[ends.length - 1]).toBe('end:failure');
+    const st = await stub.state(ID);
+    expect(st.deliveries.find((d) => d.seq === 2 && d.effect === 'status')?.state).toBe('done');
+    expect(st.deliveries.filter((d) => d.state === 'pending')).toHaveLength(0);
+  });
+
+  it('a verdict arriving while an older status write is in flight still ends with the newer status', async () => {
+    const states: string[] = [];
+    gh.on('POST /repos/o/r/statuses/*', async (c) => {
+      const state = (c.body as { state: string }).state;
+      // The Dub it's write is slow; the Revise lands while it is in flight.
+      await new Promise((r) => setTimeout(r, state === 'success' ? 80 : 1));
+      states.push(state);
+      return { status: 201, body: { id: 1 } };
+    });
+    const p1 = stub.submitVerdict(ID, verdict({ verdict: 'dub' }));
+    await new Promise((r) => setTimeout(r, 20));
+    const p2 = stub.submitVerdict(ID, verdict({ verdict: 'revise' }));
+    const [a, b] = await Promise.all([p1, p2]);
+    expect(ok(a).seq).toBe(1);
+    expect(ok(b).seq).toBe(2);
+    expect(states).toEqual(['success', 'failure']);
+    const st = await stub.state(ID);
+    expect(st.deliveries.find((d) => d.seq === 1 && d.effect === 'status')?.state).toBe('done');
+    expect(st.deliveries.find((d) => d.seq === 2 && d.effect === 'status')?.state).toBe('done');
+    expect(st.deliveries.filter((d) => d.state === 'pending')).toHaveLength(0);
+  });
+
+  it('commits the event and every delivery intent before any await, so a crash still delivers', async () => {
+    await runInDurableObject(stub, (inst: PullRequest) => {
+      inst.afterCommit = () => {
+        throw new AbortAfterCommit('simulated crash after commit');
+      };
+    });
+    expect(await stub.submitVerdict(ID, verdict({ verdict: 'reject' }))).toEqual({ error: expect.stringMatching(/aborted after commit/) });
+    let st = await stub.state(ID);
+    expect(st.verdicts).toHaveLength(1);
+    const rows = st.deliveries.filter((d) => d.seq === 1);
+    expect(rows.map((d) => [d.effect, d.state]).sort()).toEqual([
+      ['close', 'pending'],
+      ['review', 'pending'],
+      ['status', 'pending'],
+      ['sticky', 'pending'],
+    ]);
+    expect(rows.find((d) => d.effect === 'review')?.next_at).toBe(now + 60_000);
+    expect(gh.of('POST', '/repos/o/r/pulls/1/reviews')).toHaveLength(0);
+    await runInDurableObject(stub, (inst: PullRequest) => {
+      inst.afterCommit = null;
+    });
+    // The alarm set in the commit block delivers the App effects…
+    await setNow(now + 2000);
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    st = await stub.state(ID);
+    expect(st.deliveries.find((d) => d.effect === 'status')?.state).toBe('done');
+    expect(gh.of('POST', `/repos/o/r/statuses/${SHA_A}`).at(-1)!.body).toMatchObject({ state: 'failure' });
+    expect(st.deliveries.find((d) => d.effect === 'review')?.state).toBe('pending');
+    // …and, once the grace period is over, the review on the reviewer's behalf.
+    await setNow(now + 61_000);
+    await runDurableObjectAlarm(stub);
+    st = await stub.state(ID);
+    expect(st.deliveries.find((d) => d.effect === 'review')?.state).toBe('done');
+    const review = gh.of('POST', '/repos/o/r/pulls/1/reviews')[0]!;
+    expect(review.auth).toBe('Bearer ghs_app');
+    expect(String((review.body as { body: string }).body)).toContain('on behalf of @ryan');
+    expect(st.verdicts[0]?.on_behalf).toBe(true);
+  });
+
+  it('reserveBundle: new, identical retry, and conflicting content', async () => {
+    const r1 = await stub.reserveBundle(ID, { bundle_id: BUNDLE_2, sha: SHA_A, digest: 'd1', received_at: new Date(now).toISOString() });
+    expect(r1).toEqual({ existing: false });
+    let st = await stub.state(ID);
+    expect(st.bundles.find((b) => b.bundle_id === BUNDLE_2)).toMatchObject({ complete: false, digest: 'd1' });
+    const r2 = await stub.reserveBundle(ID, { bundle_id: BUNDLE_2, sha: SHA_A, digest: 'd1', received_at: 'later' });
+    expect(r2).toEqual({ existing: true, complete: false });
+    await stub.recordBundle(ID, { bundle_id: BUNDLE_2, sha: SHA_A, received_at: 'ignored', criteria: [{ id: 'ac-1', status: 'pass' }] });
+    st = await stub.state(ID);
+    expect(st.bundles.find((b) => b.bundle_id === BUNDLE_2)).toMatchObject({ complete: true, digest: 'd1', received_at: new Date(now).toISOString() });
+    expect(await stub.reserveBundle(ID, { bundle_id: BUNDLE_2, sha: SHA_A, digest: 'd1', received_at: 'x' })).toEqual({ existing: true, complete: true });
+    expect(await stub.reserveBundle(ID, { bundle_id: BUNDLE_2, sha: SHA_A, digest: 'd2', received_at: 'x' })).toEqual({ conflict: true, digest: 'd1' });
+    expect(await stub.reserveBundle(ID, { bundle_id: BUNDLE_2, sha: SHA_B, digest: 'd1', received_at: 'x' })).toEqual({ conflict: true, digest: 'd1' });
+  });
+
+  it('asks GitHub before closing and backs off if the PR moved or closed meanwhile', async () => {
+    gh.on('GET /repos/o/r/pulls/1', () => ({
+      body: { number: 1, state: 'open', merged: false, head: { sha: SHA_B, ref: 'feat', repo: { full_name: 'o/r' } }, base: { sha: 'b', ref: 'main' }, user: { login: 'agent-app[bot]' }, html_url: 'u' },
+    }));
+    await stub.submitVerdict(ID, verdict({ verdict: 'reject' }));
+    expect(gh.of('GET', '/repos/o/r/pulls/1')).toHaveLength(1);
+    expect(gh.of('PATCH', '/repos/o/r/pulls/1')).toHaveLength(0);
+    const st = await stub.state(ID);
+    expect(st.deliveries.find((d) => d.effect === 'close')?.state).toBe('superseded');
+    expect(st.pr.head_sha).toBe(SHA_B);
+  });
+
+  it('close_on_reject: false records the Reject without closing', async () => {
+    await stub.submitVerdict(ID, verdict({ verdict: 'reject', close_on_reject: false }));
+    const st = await stub.state(ID);
+    expect(st.deliveries.find((d) => d.effect === 'close')).toBeUndefined();
+    expect(gh.of('PATCH', '/repos/o/r/pulls/1')).toHaveLength(0);
+    expect(gh.of('POST', `/repos/o/r/statuses/${SHA_A}`).at(-1)!.body).toMatchObject({ state: 'failure' });
+  });
+
+  it('replays a verdict with the same idempotency key instead of recording a second one', async () => {
+    const key = crypto.randomUUID();
+    const first = ok(await stub.submitVerdict(ID, verdict({ idempotency_key: key, note: 'first' })));
+    const again = ok(await stub.submitVerdict(ID, verdict({ idempotency_key: key, verdict: 'reject', note: 'second' })));
+    expect(again).toEqual({ ...first, replayed: true });
+    const st = await stub.state(ID);
+    expect(st.verdicts).toHaveLength(1);
+    expect(st.verdicts[0]).toMatchObject({ verdict: 'dub', note: 'first', idempotency_key: key });
+    expect(gh.of('POST', '/repos/o/r/pulls/1/reviews')).toHaveLength(1);
+    const other = ok(await stub.submitVerdict(ID, verdict({ idempotency_key: crypto.randomUUID() })));
+    expect(other.seq).toBe(2);
   });
 });

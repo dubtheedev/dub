@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { criteriaDiff, parseRubric, previousFor, rubricHits } from '../src/lib/meta';
-import type { Criterion, VerdictEvent } from '../src/types';
+import { artifactDiff, criteriaDiff, parseRubric, previousFor, rubricHits } from '../src/lib/meta';
+import type { BundleCriterion, Criterion, VerdictEvent } from '../src/types';
 
 const c = (id: string, text: string, kind: Criterion['kind'] = 'visual'): Criterion => ({ id, text, kind });
 
@@ -75,5 +75,33 @@ describe('rubric', () => {
     expect(rubricHits(RUBRIC, ['Email'])).toEqual(['Plain tone, no exclamation marks', 'Every list has an empty state', "Dates are shown in the reader's timezone"]);
     expect(rubricHits(RUBRIC, ['invoices'])).toEqual(['Every list has an empty state', "Dates are shown in the reader's timezone"]);
     expect(rubricHits(RUBRIC, undefined)).toHaveLength(2);
+  });
+});
+
+describe('artifactDiff', () => {
+  const bc = (id: string, ev: { path: string; hash?: string }[], files?: { path: string; sha256: string }[]): BundleCriterion => ({
+    id,
+    kind: 'visual',
+    status: 'pass',
+    evidence: ev.map((e) => ({ type: 'image', ...e })),
+    spec: files ? { files } : undefined,
+  });
+  it('is all null without a previous bundle', () => {
+    expect(artifactDiff(null, [bc('ac-1', [{ path: 'a.png', hash: 'h1' }], [{ path: 's.ts', sha256: 'x' }])])).toEqual([
+      { id: 'ac-1', spec_changed: null, evidence: [{ path: 'a.png', artifact_changed: null }] },
+    ]);
+  });
+  it('compares hashes per path and spec file fingerprints per criterion', () => {
+    const prev = [bc('ac-1', [{ path: 'a.png', hash: 'h1' }, { path: 'b.png', hash: 'h2' }], [{ path: 's.ts', sha256: 'x' }, { path: 'h.ts', sha256: 'y' }]), bc('ac-2', [{ path: 'c.png', hash: 'h3' }])];
+    const next = [
+      bc('ac-1', [{ path: 'a.png', hash: 'h1' }, { path: 'b.png', hash: 'h2b' }, { path: 'n.png', hash: 'h9' }], [{ path: 'h.ts', sha256: 'y' }, { path: 's.ts', sha256: 'x' }]),
+      bc('ac-2', [{ path: 'c.png' }], [{ path: 's2.ts', sha256: 'z' }]),
+      bc('ac-3', [{ path: 'd.png', hash: 'h4' }]),
+    ];
+    expect(artifactDiff(prev, next)).toEqual([
+      { id: 'ac-1', spec_changed: false, evidence: [{ path: 'a.png', artifact_changed: false }, { path: 'b.png', artifact_changed: true }, { path: 'n.png', artifact_changed: null }] },
+      { id: 'ac-2', spec_changed: null, evidence: [{ path: 'c.png', artifact_changed: null }] },
+      { id: 'ac-3', spec_changed: null, evidence: [{ path: 'd.png', artifact_changed: null }] },
+    ]);
   });
 });

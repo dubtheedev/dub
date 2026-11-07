@@ -1,18 +1,25 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { SELF, env } from 'cloudflare:test';
 import { hmacHex, signCliToken, signSession } from '../src/lib/session';
+import { signOAuthState } from '../src/lib/oauth';
 import type { Bundle, Meta } from '../src/types';
-import { BUNDLE_1, BUNDLE_2, FakeGitHub, SHA_A, SHA_B } from './fake-github';
+import { FakeGitHub, SHA_A, SHA_B } from './fake-github';
 import { ustar } from './tar-build';
 
 let gh: FakeGitHub;
+// Storage is not isolated between tests, so every test gets its own bundle ids.
+let BUNDLE_1: string;
+let BUNDLE_2: string;
+const ulid = () => Array.from({ length: 26 }, () => '0123456789ABCDEFGHJKMNPQRSTVWXYZ'[Math.floor(Math.random() * 32)]).join('');
 beforeEach(() => {
   gh = new FakeGitHub();
   gh.install();
+  BUNDLE_1 = ulid();
+  BUNDLE_2 = ulid();
 });
 afterEach(() => gh.uninstall());
 
-const OIDC = { repository: 'o/r', event_name: 'pull_request', ref: 'refs/pull/1/merge', sha: 'merge-sha', run_id: '7', workflow: 'Review app' };
+const OIDC = { repository: 'o/r', event_name: 'pull_request', ref: 'refs/pull/1/merge', sha: 'merge-sha', run_id: '7', workflow: 'Review app', job_workflow_ref: 'o/r/.github/workflows/review-app.yml@refs/pull/1/merge' };
 
 function bundle(over: Partial<Bundle> = {}): Bundle {
   return {
@@ -43,8 +50,8 @@ function bundle(over: Partial<Bundle> = {}): Bundle {
   };
 }
 
-async function upload(b: Bundle, files: { name: string; data: Uint8Array }[] = [{ name: './ac-1/list.png', data: new TextEncoder().encode('PNG') }]) {
-  const token = await gh.oidcToken(OIDC);
+async function upload(b: Bundle, files: { name: string; data: Uint8Array }[] = [{ name: './ac-1/list.png', data: new TextEncoder().encode('PNG') }], claims = OIDC) {
+  const token = await gh.oidcToken(claims);
   const form = new FormData();
   form.set('dub.json', new File([JSON.stringify(b)], 'dub.json', { type: 'application/json' }));
   form.set('evidence.tar', new File([ustar(files)], 'evidence.tar', { type: 'application/x-tar' }));
@@ -73,7 +80,7 @@ describe('bundle intake', () => {
   it('requires a pull_request OIDC token for the same repo and PR', async () => {
     const noAuth = await SELF.fetch('https://dub.test/api/bundles', { method: 'POST', body: new FormData() });
     expect(noAuth.status).toBe(401);
-    const wrongRepo = await gh.oidcToken({ ...OIDC, repository: 'o/other' });
+    const wrongRepo = await gh.oidcToken({ ...OIDC, repository: 'o/other', job_workflow_ref: 'o/other/.github/workflows/review-app.yml@refs/pull/1/merge' });
     const form = new FormData();
     form.set('dub.json', new File([JSON.stringify(bundle())], 'dub.json'));
     const r = await SELF.fetch('https://dub.test/api/bundles', { method: 'POST', headers: { authorization: `Bearer ${wrongRepo}` }, body: form });
@@ -122,6 +129,35 @@ describe('bundle intake', () => {
       ['ac-2', 'removed'],
     ]);
     expect(meta2.rubric.hits).toEqual(['Empty states everywhere']);
+    // Artifact and spec comparison against `previous`.
+    expect(meta.criteria).toEqual([
+      { id: 'ac-1', spec_changed: null, evidence: [{ path: 'ac-1/list.png', artifact_changed: null }] },
+      { id: 'ac-2', spec_changed: null, evidence: [{ path: 'ac-2/tone.png', artifact_changed: null }] },
+    ]);
+    expect(meta2.criteria[0]).toEqual({ id: 'ac-1', spec_changed: false, evidence: [{ path: 'ac-1/list.png', artifact_changed: false }] });
+  });
+
+  it('is idempotent for a retry with identical bytes and refuses a different payload under the same id', async () => {
+    const b = bundle();
+    expect((await upload(b)).status).toBe(201);
+    const again = await upload(b);
+    expect(again.status).toBe(200);
+    expect(await again.json()).toMatchObject({ bundle_id: BUNDLE_1, existing: true });
+    const changed = await upload(bundle({ notes: { did: ['something else'] } }));
+    expect(changed.status).toBe(409);
+    // The stored bundle is the original.
+    const stored = (await env.BUNDLES.get(`o/r/1/${SHA_A}/${BUNDLE_1}/dub.json`).then((o) => o!.json())) as Bundle;
+    expect(stored.notes?.did).toEqual(['Added the badge']);
+  });
+
+  it('enforces the configured publishing workflow', async () => {
+    gh.on('GET /repos/o/r/contents/.dub/config.yml', () => ({ body: { encoding: 'base64', sha: 'c', content: btoa('reviewers: [ryan]\npublish_workflow: review-app.yml\n') } }));
+    const wrong = await upload(bundle(), undefined, { ...OIDC, job_workflow_ref: 'o/r/.github/workflows/ci.yml@refs/pull/1/merge' });
+    expect(wrong.status).toBe(403);
+    expect(((await wrong.json()) as { error: string }).error).toMatch(/review-app.yml, not ci.yml/);
+    expect((await upload(bundle())).status).toBe(201);
+    const foreign = await upload(bundle({ bundle_id: BUNDLE_2 }), undefined, { ...OIDC, job_workflow_ref: 'other/repo/.github/workflows/review-app.yml@refs/heads/main' });
+    expect(foreign.status).toBe(401);
   });
 });
 
@@ -158,6 +194,31 @@ describe('review page and API', () => {
     expect((await SELF.fetch(`https://dub.test/api/bundles/o/r/1/${SHA_A}/${BUNDLE_1}/ac-1/list.png`)).status).toBe(401);
   });
 
+  it('never serves bundle files as active content', async () => {
+    const enc = new TextEncoder();
+    await upload(bundle(), [
+      { name: 'ac-1/list.png', data: enc.encode('PNG') },
+      { name: 'ac-1/x.svg', data: enc.encode('<svg onload="alert(1)"/>') },
+      { name: 'ac-1/x.html', data: enc.encode('<script>alert(1)</script>') },
+      { name: 'ac-1/trace.zip', data: enc.encode('PK') },
+    ]);
+    const get = async (name: string) => SELF.fetch(`https://dub.test/api/bundles/o/r/1/${SHA_A}/${BUNDLE_1}/ac-1/${name}`, { headers: { cookie: await cookieFor('reader') } });
+    const png = await get('list.png');
+    expect(png.status).toBe(200);
+    expect(png.headers.get('content-type')).toBe('image/png');
+    expect(png.headers.get('content-disposition')).toBe('inline; filename="list.png"');
+    expect(png.headers.get('content-security-policy')).toBe("sandbox; default-src 'none'");
+    expect(png.headers.get('x-content-type-options')).toBe('nosniff');
+    for (const name of ['x.svg', 'x.html', 'trace.zip']) {
+      const r = await get(name);
+      expect(r.status).toBe(200);
+      expect(r.headers.get('content-type')).toBe('application/octet-stream');
+      expect(r.headers.get('content-disposition')).toBe(`attachment; filename="${name}"`);
+      expect(r.headers.get('content-security-policy')).toBe("sandbox; default-src 'none'");
+      expect(r.headers.get('x-content-type-options')).toBe('nosniff');
+    }
+  });
+
   it('shows a waiting page when no bundle exists yet', async () => {
     const r = await SELF.fetch('https://dub.test/r/o/r/pull/2', { headers: { accept: 'text/html', cookie: await cookieFor('ryan') } });
     expect(r.status).toBe(404);
@@ -177,22 +238,39 @@ describe('review page and API', () => {
 });
 
 describe('verdicts', () => {
-  const body = { owner: 'o', repo: 'r', pr: 1, sha: SHA_A, bundle_id: BUNDLE_1, verdict: 'dub', note: 'ship it', used: ['preview'], because: [] };
+  const body = () => ({ owner: 'o', repo: 'r', pr: 1, sha: SHA_A, bundle_id: BUNDLE_1, verdict: 'dub', note: 'ship it', used: ['preview'], because: [] });
   const post = (cookie: string, over: Record<string, unknown> = {}, headers: Record<string, string> = {}) =>
-    SELF.fetch('https://dub.test/api/verdicts', { method: 'POST', headers: { 'content-type': 'application/json', cookie, origin: 'https://dub.test', ...headers }, body: JSON.stringify({ ...body, ...over }) });
+    SELF.fetch('https://dub.test/api/verdicts', { method: 'POST', headers: { 'content-type': 'application/json', cookie, origin: 'https://dub.test', ...headers }, body: JSON.stringify({ idempotency_key: crypto.randomUUID(), ...body(), ...over }) });
 
   it('records a verdict for an authorised reviewer and posts the review with their token', async () => {
     await upload(bundle());
     const r = await post(await cookieFor('ryan'));
     expect(r.status).toBe(201);
-    expect(await r.json()).toMatchObject({ seq: 1, effective: { sha: SHA_A, verdict: 'dub', seq: 1 }, historical: false, review: 'posted' });
+    const j = (await r.json()) as { seq: number };
+    expect(j).toMatchObject({ seq: j.seq, effective: { sha: SHA_A, verdict: 'dub', seq: j.seq }, historical: false, review: 'posted' });
     const review = gh.of('POST', '/repos/o/r/pulls/1/reviews')[0]!;
     expect(review.auth).toBe('Bearer gho_ryan');
     expect(String((review.body as { body: string }).body)).toContain('ship it');
     expect(gh.of('POST', `/repos/o/r/statuses/${SHA_A}`).at(-1)!.body).toMatchObject({ state: 'success' });
     const state = (await (await SELF.fetch('https://dub.test/api/prs/o/r/1', { headers: { cookie: await cookieFor('reader') } })).json()) as { verdicts: unknown[]; head_sha: string };
-    expect(state.verdicts).toHaveLength(1);
+    expect(state.verdicts.length).toBeGreaterThanOrEqual(1);
     expect(state.head_sha).toBe(SHA_A);
+  });
+
+  it('replays a page submission with the same key and lets the API omit the key', async () => {
+    await upload(bundle());
+    const key = crypto.randomUUID();
+    const first = await post(await cookieFor('ryan'), { idempotency_key: key });
+    expect(first.status).toBe(201);
+    const seq = ((await first.json()) as { seq: number }).seq;
+    const again = await post(await cookieFor('ryan'), { idempotency_key: key, verdict: 'reject' });
+    expect(again.status).toBe(200);
+    expect(await again.json()).toMatchObject({ seq, replayed: true });
+    expect(gh.of('POST', '/repos/o/r/pulls/1/reviews')).toHaveLength(1);
+    const token = await signCliToken(env.SESSION_SECRET, { login: 'ryan', user_token: 'gho_ryan' });
+    const api = await SELF.fetch('https://dub.test/api/verdicts', { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify({ ...body(), verdict: 'revise' }) });
+    expect(api.status).toBe(201);
+    expect(await api.json()).toMatchObject({ seq: seq + 1 });
   });
 
   it('refuses non-reviewers, the PR author, cross-origin cookies, and bad input', async () => {
@@ -205,6 +283,8 @@ describe('verdicts', () => {
     expect(((await author.json()) as { error: string }).error).toMatch(/author/);
     expect((await post(await cookieFor('ryan'), {}, { origin: 'https://evil.example' })).status).toBe(403);
     expect((await post(await cookieFor('ryan'), { verdict: 'approve' })).status).toBe(400);
+    expect((await post(await cookieFor('ryan'), { idempotency_key: undefined })).status).toBe(400);
+    expect((await post(await cookieFor('ryan'), { idempotency_key: 'not-a-uuid' })).status).toBe(400);
     expect((await post(await cookieFor('ryan'), { bundle_id: BUNDLE_2 })).status).toBe(422);
     expect(gh.of('POST', '/repos/o/r/pulls/1/reviews')).toHaveLength(0);
   });
@@ -234,7 +314,7 @@ describe('dub pr and CLI tokens', () => {
     expect(me.status).toBe(200);
   });
 
-  it('starts the OAuth dance with a signed state', async () => {
+  it('starts the OAuth dance with a signed state bound to a browser cookie', async () => {
     const r = await SELF.fetch('https://dub.test/auth/login?cli=1', { redirect: 'manual' });
     expect(r.status).toBe(302);
     const loc = new URL(r.headers.get('location')!);
@@ -242,5 +322,24 @@ describe('dub pr and CLI tokens', () => {
     expect(loc.searchParams.get('client_id')).toBe('Iv1.test');
     expect(loc.searchParams.get('redirect_uri')).toBe('https://dub.test/auth/callback');
     expect(loc.searchParams.get('state')).toMatch(/^[A-Za-z0-9_-]+\.[0-9a-f]{64}$/);
+    const cookie = r.headers.get('set-cookie')!;
+    expect(cookie).toMatch(/^dub_oauth=[0-9a-f-]{36}; Path=\/auth; HttpOnly; SameSite=Lax; Max-Age=600; Secure$/);
+  });
+
+  it('redeems the OAuth callback only with the matching cookie', async () => {
+    const nonce = crypto.randomUUID();
+    const state = await signOAuthState(env.SESSION_SECRET, { n: nonce, cli: true, next: '/' });
+    const url = `https://dub.test/auth/callback?code=abc&state=${encodeURIComponent(state)}`;
+    expect((await SELF.fetch(url, { redirect: 'manual' })).status).toBe(400);
+    expect((await SELF.fetch(url, { redirect: 'manual', headers: { cookie: `dub_oauth=${crypto.randomUUID()}` } })).status).toBe(400);
+    expect((await SELF.fetch(`https://dub.test/auth/callback?code=abc&state=${encodeURIComponent(state.slice(0, -1) + '0')}`, { redirect: 'manual', headers: { cookie: `dub_oauth=${nonce}` } })).status).toBe(400);
+    expect(gh.of('POST', '/login/oauth/access_token')).toHaveLength(0);
+    const ok = await SELF.fetch(url, { redirect: 'manual', headers: { cookie: `dub_oauth=${nonce}` } });
+    expect(ok.status).toBe(302);
+    expect(ok.headers.get('location')).toBe('/auth/token');
+    const cookies = ok.headers.getSetCookie();
+    expect(cookies.some((c) => c.startsWith('dub_session=') && c.includes('HttpOnly'))).toBe(true);
+    expect(cookies.some((c) => c.startsWith('dub_oauth=;') && c.includes('Max-Age=0'))).toBe(true);
+    expect(gh.of('POST', '/login/oauth/access_token')[0]!.body).toMatchObject({ code: 'abc', client_id: 'Iv1.test' });
   });
 });

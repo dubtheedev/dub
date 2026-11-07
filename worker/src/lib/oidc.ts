@@ -11,6 +11,10 @@ export interface ActionsClaims {
   sha: string;
   run_id: string;
   workflow: string;
+  /** e.g. `o/r/.github/workflows/review-app.yml@refs/pull/1/merge` */
+  job_workflow_ref: string;
+  /** The file name from job_workflow_ref, e.g. `review-app.yml`. */
+  workflow_file: string;
   pr: number;
 }
 
@@ -41,13 +45,24 @@ export async function verifyActionsToken(
   const ref = str('ref');
   const m = /^refs\/pull\/(\d+)\/merge$/.exec(ref);
   if (!m) throw new OidcError(`OIDC ref must be refs/pull/<n>/merge, got ${ref}`);
+  const repository = str('repository');
+  // The workflow that minted the token must live in the repo itself, not in a
+  // reusable workflow somewhere else.
+  const job_workflow_ref = str('job_workflow_ref');
+  const prefix = `${repository}/.github/workflows/`;
+  if (!job_workflow_ref.toLowerCase().startsWith(prefix.toLowerCase())) {
+    throw new OidcError(`OIDC job_workflow_ref must start with ${prefix}, got ${job_workflow_ref}`);
+  }
+  const workflow_file = job_workflow_ref.slice(prefix.length).split('@')[0] ?? '';
   return {
-    repository: str('repository'),
+    repository,
     event_name,
     ref,
     sha: str('sha'),
     run_id: String(payload.run_id ?? ''),
     workflow: String(payload.workflow ?? ''),
+    job_workflow_ref,
+    workflow_file,
     pr: Number(m[1]),
   };
 }
