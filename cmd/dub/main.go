@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -53,7 +54,7 @@ func main() {
 	case "login":
 		err = cmdLogin(os.Args[2:])
 	case "version", "--version", "-v":
-		fmt.Println("dub", version)
+		fmt.Println("dub", resolvedVersion())
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 	default:
@@ -347,4 +348,17 @@ func short(sha string) string {
 		return sha[:7]
 	}
 	return sha
+}
+
+// resolvedVersion is the -X main.version from a release build, or the module
+// version Go recorded for a `go install …@latest`, so a binary that was never
+// built by the Makefile still says which commit it is.
+func resolvedVersion() string {
+	if version != "dev" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return version
 }
