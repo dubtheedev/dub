@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     paths: ["runner/**", ".github/workflows/runner.yml"]
+  workflow_dispatch:
   pull_request:
     paths: ["runner/**", ".github/workflows/runner.yml"]
 
