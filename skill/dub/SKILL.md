@@ -65,7 +65,10 @@ import { test, expect } from '@dub/test';
 import { signIn } from './helpers';   // relative imports are inlined into the bundle
 
 test.beforeAll(async ({ request }) => {
-  await request.post('/dev/reset');   // only when you need a clean slate
+  // Only when you need a clean slate. The re-seed takes 20–30s on a review
+  // app, longer than Playwright's default 30s hook timeout.
+  test.setTimeout(120_000);
+  await request.post('/dev/reset', { timeout: 120_000 });
 });
 
 test('ac-1', async ({ page }) => {
