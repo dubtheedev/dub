@@ -43,7 +43,7 @@ docs/               spec, feedback, this contract, setup
 
 - `GET /__dub/version` → `200 application/json` `{"sha":"<40 hex>"}`; `{"sha":null}` when unset. Headers: `access-control-allow-origin: <origin>` for allowed origins, `cache-control: no-store`.
 - Every response carries `x-dub-sha: <40 hex>` (omitted when unset).
-- `POST /dev/reset` (review apps only, 404 elsewhere) truncates every table except `schema_migrations` and re-runs the review seed. Returns `200 {"ok":true}`. Idempotent. Also accepts `GET` for a browser.
+- `POST /dev/reset` (review apps only, 404 elsewhere) truncates every table except `schema_migrations` and re-runs the review seed. Returns `200 {"ok":true}`. Idempotent. POST only.
 - Existing: `/dev/mailbox`, `/dev/deliver`, four accounts with `review_password_123`.
 
 ## Brief (`.dub/briefs/<slug>.md`)
