@@ -1,0 +1,30 @@
+name = "dub"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+compatibility_flags = ["nodejs_compat"]
+
+routes = [
+  { pattern = "dubthee.dev", custom_domain = true }
+]
+
+[vars]
+GITHUB_OIDC_AUDIENCE = "dubthee.dev"
+# Comma separated. The review page and the CLI token flow live here.
+ALLOWED_ORIGINS = "https://dubthee.dev"
+PUBLIC_URL = "https://dubthee.dev"
+
+[[durable_objects.bindings]]
+name = "PR"
+class_name = "PullRequest"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PullRequest"]
+
+[[r2_buckets]]
+binding = "BUNDLES"
+bucket_name = "dub-bundles"
+
+# Secrets (wrangler secret put):
+#   GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY, GITHUB_WEBHOOK_SECRET,
+#   GITHUB_OAUTH_CLIENT_ID, GITHUB_OAUTH_CLIENT_SECRET, SESSION_SECRET

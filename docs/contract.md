@@ -1,0 +1,139 @@
+# Dub — build contract (v0.3 + feedback)
+
+The spec is `docs/spec-v0.3.md`; the review of it is `docs/spec-v0.3-feedback.md`.
+This file records what the code actually does where the two had to be
+reconciled. When this file and the spec disagree, this file wins.
+
+## Decisions taken from the feedback
+
+| # | Decision |
+|---|---|
+| 1 | **The deployed SHA is the PR head SHA.** The review-app job checks out `github.event.pull_request.head.sha` with `fetch-depth: 0` and passes it to the image as `GIT_SHA`. `dub.json.sha` is the head SHA. The merge SHA is not recorded anywhere; CI and code review cover the merge result. |
+| 2 | **`previous`, `criteria_diff` and `rubric.hits` are computed by the Worker at intake** and stored in `meta.json` next to the bundle. `dub.json` is self-contained and never references Worker state. The CLI emits structured criteria (`brief.criteria[]`) so the Worker can diff without parsing markdown. |
+| 3 | **Effects are split by credential.** The COMMENT review (as the human) is tried synchronously up to 3 times, then the App posts the same review body prefixed "on behalf of @reviewer". The status write, PR close and sticky comment are App-credentialed and go to the alarm reconciler. There is no separate verdict comment; the structured block lives in the review body. |
+| 4 | **You push the branch as yourself; `dub pr` creates the PR as the App** through one Worker endpoint. Branch protection: "Require approval of the most recent reviewable push" OFF, "Require branches to be up to date" OFF, "Dismiss stale reviews" ON. |
+| 5 | `fetch-depth: 0` is required for provenance; without full history `first_seen_sha` is `unknown`. |
+| 6 | **`/__dub/version` sends CORS for `https://dubthee.dev`** (and `http://localhost:8787` in review apps) and sits outside every auth pipeline. **Every response also carries `x-dub-sha`**, set by one endpoint plug. Both read `GIT_SHA`, baked at build and read once at boot. |
+| 7 | `synchronize` sets `dubbed: pending` on the new head immediately, description "Waiting for evidence bundle", target the review page. |
+| 8 | `pull_request.closed` is subscribed; the DO marks pending deliveries `superseded` and cancels its alarm. |
+| 9 | **Judgment specs never assert.** The runner reports any failed expectation in a `judgment` criterion as `error`, never `fail`. The skill says so. |
+| 10 | Criterion ids are stable; the skill forbids renumbering. |
+| 11 | `preview_moved` makes every status `error` but artifacts stay in the bundle and the page shows them under a banner. |
+| 12 | Delivery state stores the GitHub `review_id`, `comment_id` so a retry edits rather than duplicates. |
+| 13 | **Header and endpoint from one source.** The runner's fixture checks `x-dub-sha` on every document response; a mismatch turns the remaining criteria into `error` with `preview_moved`. |
+| 14 | **Spec imports are copied verbatim.** Relative imports only, resolution stops at `node_modules`, and the bundle lists every inlined file with its sha256. |
+| 15 | Reconciler backoff: 30s doubling, capped at 1h, give up after 24h. On give-up the delivery is `failed` and surfaced in the sticky comment and the page header. Status PUTs may retry forever within the window; close and comment use the stored ids. |
+| 16 | **Pilot scope:** the data model supports many reviewers and bundles; the page shows one reviewer flow and the newest bundle per SHA only. No rerun UI, no multi-bundle picker. |
+
+The Missive workflow already has a workflow-level concurrency group; it stays.
+
+## Layout of this repo
+
+```
+cmd/dub/            Go CLI: init, pack, publish, pr, login
+internal/           brief, bundle, inline, provenance, preview, runner, publish, gh
+runner/             ghcr.io/dubtheedev/runner — Playwright harness image
+worker/             Cloudflare Worker + Durable Object (TypeScript)
+skill/dub/          Claude Code skill for agents writing briefs and specs
+docs/               spec, feedback, this contract, setup
+.dub-out/           default `dub pack` output in a host repo (gitignored by `dub init`)
+```
+
+## Preview contract (host app, Missive)
+
+- `GET /__dub/version` → `200 application/json` `{"sha":"<40 hex>"}`; `{"sha":null}` when unset. Headers: `access-control-allow-origin: <origin>` for allowed origins, `cache-control: no-store`.
+- Every response carries `x-dub-sha: <40 hex>` (omitted when unset).
+- `POST /dev/reset` (review apps only, 404 elsewhere) truncates every table except `schema_migrations` and re-runs the review seed. Returns `200 {"ok":true}`. Idempotent. Also accepts `GET` for a browser.
+- Existing: `/dev/mailbox`, `/dev/deliver`, four accounts with `review_password_123`.
+
+## Brief (`.dub/briefs/<slug>.md`)
+
+Front matter `id` (required, equals the slug), optional `issue`. First `#` heading is the title. A `**Why:**` paragraph. An `## Acceptance` section with lines:
+
+```
+- [ac-1] Criterion text   {kind: visual}
+```
+
+Kinds: `visual | behaviour | check | judgment`. Ids match `^[a-z][a-z0-9-]*$` and are never reused or renumbered. `dub pack` refuses a brief with zero criteria, a duplicate id, or an unknown kind.
+
+## Evidence specs (`.dub/evidence/*.spec.ts`)
+
+One `test('<criterion id>', …)` per criterion. Title is the id exactly. Specs import `test` and `expect` from **`@dub/test`** (never `@playwright/test` directly): the runner image provides it as Playwright's `test`/`expect` extended with an auto fixture that checks `x-dub-sha` on every document response. Specs may import relative modules under `.dub/`. Fixtures are in the spec, idempotent and safe from a half-mutated state; a clean slate is `/dev/reset` in `beforeAll`. Judgment criteria may have a spec for *supporting* artifacts but it must not `expect` anything.
+
+## Runner interface (`ghcr.io/dubtheedev/runner`)
+
+```
+docker run --rm \
+  -v <repo>/.dub:/work/.dub:ro \
+  -v <out>:/out \
+  -e DUB_PREVIEW_URL=https://pr-87-misiva.fly.dev \
+  -e DUB_SHA=<head sha> \
+  -e DUB_CRITERIA='[{"id":"ac-1","kind":"visual"}, …]' \
+  ghcr.io/dubtheedev/runner@sha256:…
+```
+
+Inside: `workers: 1`, `retries: 0`, `baseURL=DUB_PREVIEW_URL`, trace `on`, video `on`, screenshots to `/out/<id>/`. `/work/node_modules` is a symlink to the image's own install, so `@dub/test` and `@playwright/test` resolve from `/work/.dub/evidence` without the host repo installing anything. The `@dub/test` fixture asserts `x-dub-sha == DUB_SHA` on every document response; mismatch throws `DubPreviewMoved`. Output `/out/results.json`:
+
+```json
+{ "preview_moved": false,
+  "tests": [ { "id": "ac-1", "status": "passed|failed|timedOut|skipped|interrupted",
+               "error": "…", "steps": ["goto /invoices", "expect badge visible"],
+               "attachments": [ {"name":"screenshot","path":"ac-1/list.png","contentType":"image/png"} ] } ] }
+```
+
+Status mapping in the CLI: `passed→pass`; `failed→fail` unless kind is `judgment`, then `error`; `timedOut|interrupted|DubPreviewMoved→error`; no test for the id → `none`; `preview_moved → error` for all.
+
+## `dub.json` (version 0)
+
+As in the spec, with these clarifications:
+
+- `sha` is the head SHA. `preview.preview_sha` is what `/__dub/version` returned before the run; `preview.moved` true if the after-check or any page-load check differed.
+- `brief.criteria`: `[{id, kind, text}]` in brief order, parsed by the CLI. `brief.text` is the whole file.
+- `brief.first_seen_sha`: first commit on the PR branch (relative to `merge-base` with the base) that adds the brief path, or `null`. `before_implementation`: `true` when every other changed file first appears at or after that commit, `false` when at least one appears earlier, `unknown` when history is shallow or the brief was never added on the branch.
+- `criteria[].spec.files`: `[{path, sha256}]` for the spec and each inlined relative import; `spec.source` is those files concatenated with `// ---- <path>` separators. `spec.external_imports` lists bare specifiers.
+- No `previous`, no `criteria_diff`, no `rubric.hits` in `dub.json`. `rubric.base_sha` is omitted; `diff.areas` comes from `.dub/areas.yml` on the checkout.
+- `runner` is the image digest, resolved from the local image.
+
+## `meta.json` (written by the Worker at intake)
+
+```json
+{ "bundle_id": "…", "sha": "…", "received_at": "…", "head_at_intake": true,
+  "previous": { "sha": "…", "bundle_id": "…", "verdict": "revise", "seq": 3 } | null,
+  "criteria_diff": [ { "id": "ac-2", "change": "added|removed|edited", "from": "…", "to": "…" } ],
+  "rubric": { "base_sha": "…", "hits": ["…"] } }
+```
+
+`previous` is the newest bundle of the most recent *earlier* SHA that has a verdict, else the newest earlier bundle, else null. `criteria_diff` compares `brief.criteria` by id against that bundle. `rubric.hits` are the rules in the base branch's `.dub/rubric.md` whose scope intersects `diff.areas`.
+
+## Worker API
+
+| Method, path | Auth | Does |
+|---|---|---|
+| `POST /api/bundles` | Actions OIDC bearer (`aud=dubthee.dev`) | Body: multipart `dub.json` + `evidence.tar`. Checks `repository`, `event_name=pull_request`, `ref=refs/pull/<n>/merge`, and that `sha` belongs to PR `<n>`. Stores to R2 `<owner>/<repo>/<n>/<sha>/<bundle_id>/`, writes `meta.json`, sets `dubbed: pending` on `sha` if that SHA has no verdict. Returns `{bundle_id, url}`. |
+| `GET /r/:owner/:repo/pull/:n` | App OAuth session | Review page (newest bundle for head, or `?sha=`). |
+| `GET /api/prs/:owner/:repo/:n` | session, repo read | `{head_sha, bundles:[…], verdicts:[…], deliveries:[…], reopen_seq}` |
+| `GET /api/bundles/:owner/:repo/:n/:sha/:bundle_id/*` | session, repo read | Bundle files from R2. |
+| `POST /api/verdicts` | session, reviewer | `{owner, repo, pr, sha, bundle_id, verdict: dub|revise|reject, note, suggest_rule, used: [...], because: [...]}` → appends event, runs effects, returns effective state. |
+| `POST /api/prs` | session (`dub pr`) | `{owner, repo, head, base, title, body}` → PR created by the App. Returns `{number, url}`. |
+| `POST /webhooks/github` | HMAC | `pull_request` `opened|synchronize|reopened|closed`. |
+| `GET /auth/login`, `/auth/callback`, `GET /auth/token` | — | App user-to-server OAuth; `/auth/token` issues a CLI token for the signed-in user. |
+
+Status context: `dubbed`. States: `pending` (bundle awaited or awaiting verdict), `success` (dub), `failure` (revise or reject). Description carries the verdict and reviewer. `target_url` is the review page for that SHA.
+
+## Durable Object (one per `owner/repo/n`)
+
+Tables: `verdicts(seq PK, sha, bundle_id, reviewer, verdict, reason, note, used, because, at)`, `deliveries(seq, effect, state pending|done|superseded|failed, attempts, next_at, gh_id, last_error)`, `bundles(bundle_id PK, sha, received_at)`, `pr(head_sha, open, reopen_seq, closed_at)`.
+
+Effective verdict for a SHA = highest `seq` for that SHA. Effects per event: `review` (human, sync), `status` (App, effective only), `close` (App, reject only, eligibility re-checked at run), `sticky` (App, head only). Alarm: next `min(next_at)` among pending.
+
+## GitHub App
+
+Permissions: Pull requests R/W, Commit statuses R/W, Contents R (rubric, PR creation needs Contents R only; the branch is already pushed), Metadata R. Events: `pull_request`. OAuth user-to-server enabled, callback `https://dubthee.dev/auth/callback`. Secrets in the Worker: `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET`, `SESSION_SECRET`.
+
+## Repo config (`.dub/config.yml` on the base branch)
+
+```yaml
+reviewers: [ryanwsnow]      # GitHub logins allowed to write dubbed
+base: main
+preview_origin_allowlist: [https://dubthee.dev]
+```

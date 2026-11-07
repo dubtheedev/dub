@@ -1,0 +1,10 @@
+{
+  "name": "@dub/test",
+  "version": "0.0.0",
+  "description": "Playwright's test/expect with the Dub SHA guard. Specs under .dub/evidence import this, never @playwright/test directly.",
+  "type": "module",
+  "main": "./index.ts",
+  "types": "./index.ts",
+  "exports": { ".": "./index.ts" },
+  "peerDependencies": { "@playwright/test": "*" }
+}

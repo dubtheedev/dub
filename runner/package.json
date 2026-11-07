@@ -1,0 +1,19 @@
+{
+  "name": "dub-runner",
+  "private": true,
+  "version": "0.0.0",
+  "description": "ghcr.io/dubtheedev/runner — runs .dub/evidence specs against a preview",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@playwright/test": "1.65.0",
+    "@dub/test": "file:./dub-test"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.3",
+    "typescript": "5.8.3"
+  }
+}
