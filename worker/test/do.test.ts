@@ -359,3 +359,37 @@ describe('PullRequest DO', () => {
     expect(other.seq).toBe(2);
   });
 });
+
+describe('schema migration', () => {
+  it('adds the review-era columns to an object created before them', async () => {
+    const stub = env.PR.get(env.PR.idFromName(`migrate-${crypto.randomUUID()}`)) as DurableObjectStub<PullRequest>;
+    await runInDurableObject(stub, (inst: PullRequest, state) => {
+      const sql = state.storage.sql;
+      sql.exec(`DROP TABLE bundles`);
+      sql.exec(`DROP TABLE verdicts`);
+      sql.exec(`CREATE TABLE verdicts (
+        seq INTEGER PRIMARY KEY, sha TEXT NOT NULL, bundle_id TEXT NOT NULL, reviewer TEXT NOT NULL,
+        verdict TEXT NOT NULL, reason TEXT, note TEXT, used TEXT NOT NULL, because TEXT NOT NULL,
+        at TEXT NOT NULL, on_behalf INTEGER NOT NULL DEFAULT 0)`);
+      sql.exec(`CREATE TABLE bundles (
+        bundle_id TEXT PRIMARY KEY, sha TEXT NOT NULL, received_at TEXT NOT NULL, criteria TEXT NOT NULL DEFAULT '[]')`);
+      sql.exec(`INSERT INTO bundles (bundle_id, sha, received_at) VALUES ('OLD1', 'a', '2026-11-07T00:00:00Z')`);
+      sql.exec(`INSERT INTO verdicts (seq, sha, bundle_id, reviewer, verdict, used, because, at)
+                VALUES (1, 'a', 'OLD1', 'ryan', 'revise', '[]', '[]', '2026-11-07T00:00:00Z')`);
+      (inst as unknown as { migrate(): void }).migrate();
+      const cols = (t: string) => sql.exec(`PRAGMA table_info(${t})`).toArray().map((r) => r.name);
+      expect(cols('bundles')).toEqual(expect.arrayContaining(['digest', 'complete']));
+      expect(cols('verdicts')).toEqual(expect.arrayContaining(['idempotency_key', 'result']));
+      const old = sql.exec(`SELECT digest, complete FROM bundles WHERE bundle_id = 'OLD1'`).toArray()[0];
+      expect(old).toMatchObject({ digest: null, complete: 1 });
+      // Idempotent again: nothing to add, nothing thrown.
+      (inst as unknown as { migrate(): void }).migrate();
+      sql.exec(`INSERT INTO verdicts (seq, sha, bundle_id, reviewer, verdict, used, because, at, idempotency_key)
+                VALUES (2, 'a', 'OLD1', 'ryan', 'dub', '[]', '[]', '2026-11-07T00:00:01Z', 'k1')`);
+      expect(() =>
+        sql.exec(`INSERT INTO verdicts (seq, sha, bundle_id, reviewer, verdict, used, because, at, idempotency_key)
+                  VALUES (3, 'a', 'OLD1', 'ryan', 'dub', '[]', '[]', '2026-11-07T00:00:02Z', 'k1')`),
+      ).toThrow();
+    });
+  });
+});

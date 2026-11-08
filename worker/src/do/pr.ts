@@ -138,7 +138,7 @@ export class PullRequest extends DurableObject<Env> {
       seq INTEGER PRIMARY KEY, sha TEXT NOT NULL, bundle_id TEXT NOT NULL, reviewer TEXT NOT NULL,
       verdict TEXT NOT NULL, reason TEXT, note TEXT, used TEXT NOT NULL, because TEXT NOT NULL,
       at TEXT NOT NULL, on_behalf INTEGER NOT NULL DEFAULT 0,
-      idempotency_key TEXT UNIQUE, result TEXT)`);
+      idempotency_key TEXT, result TEXT)`);
     sql.exec(`CREATE TABLE IF NOT EXISTS deliveries (
       seq INTEGER NOT NULL, effect TEXT NOT NULL, sha TEXT NOT NULL,
       state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER, first_at INTEGER NOT NULL,
@@ -146,6 +146,26 @@ export class PullRequest extends DurableObject<Env> {
     sql.exec(`CREATE TABLE IF NOT EXISTS bundles (
       bundle_id TEXT PRIMARY KEY, sha TEXT NOT NULL, received_at TEXT NOT NULL, criteria TEXT NOT NULL DEFAULT '[]',
       digest TEXT, complete INTEGER NOT NULL DEFAULT 0)`);
+
+    // Objects created before a column existed keep their old table, since
+    // CREATE TABLE IF NOT EXISTS leaves it alone. Add what is missing. The
+    // unique constraint on idempotency_key is an index rather than inline so
+    // it can be added here too; SQLite lets a unique index hold many NULLs.
+    this.addColumn('bundles', 'digest', 'TEXT');
+    this.addColumn('bundles', 'complete', 'INTEGER NOT NULL DEFAULT 0');
+    this.addColumn('verdicts', 'idempotency_key', 'TEXT');
+    this.addColumn('verdicts', 'result', 'TEXT');
+    sql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS verdicts_idempotency_key ON verdicts (idempotency_key)`);
+    // A bundle with no digest was stored before reservation existed, by code
+    // that wrote everything in one go: it is complete. New rows always carry
+    // a digest, so this never touches one still being uploaded.
+    sql.exec(`UPDATE bundles SET complete = 1 WHERE complete = 0 AND digest IS NULL`);
+  }
+
+  private addColumn(table: string, column: string, decl: string): void {
+    const sql = this.ctx.storage.sql;
+    const have = sql.exec(`PRAGMA table_info(${table})`).toArray().some((r) => r.name === column);
+    if (!have) sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
   }
 
   // ---- identity -----------------------------------------------------------
