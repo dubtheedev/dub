@@ -108,7 +108,9 @@ export function renderReviewPage(d: ReviewPageData): string {
           let body = `<a href="${esc(url)}">${esc(e.path)}</a>`;
           if (e.type === 'image') body = `<a href="${esc(url)}"><img src="${esc(url)}" alt="${esc(e.path)}" loading="lazy"></a>`;
           else if (e.type === 'video') body = `<video src="${esc(url)}" controls preload="metadata"></video>`;
-          return `<div class="evidence">${body}<div class="muted">${esc(e.path)}${flags ? ' · ' + esc(flags) : ''}</div></div>`;
+          // A plain link already shows the path; only media gets it as a caption.
+          const caption = [e.type === 'image' || e.type === 'video' ? e.path : '', flags].filter(Boolean).join(' · ');
+          return `<div class="evidence">${body}${caption ? `<div class="muted">${esc(caption)}</div>` : ''}</div>`;
         })
         .join('');
       return `<div class="card" id="c-${esc(c.id)}">

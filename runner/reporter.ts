@@ -43,7 +43,10 @@ export default class DubReporter implements Reporter {
     mkdirSync(dir, { recursive: true });
     const attachments: Attachment[] = [];
     const used = new Set<string>();
+    const noPage = result.annotations?.some((a) => a.type === 'dub:no_page');
     for (const a of result.attachments) {
+      // No page was ever opened, so the video is a single blank frame.
+      if (noPage && a.name === 'video') continue;
       if (!a.path) continue;
       let name = sanitize(a.name) + (extname(a.path) || '');
       if (a.name === 'screenshot' || a.name === 'video' || a.name === 'trace') {

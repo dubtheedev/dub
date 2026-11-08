@@ -42,7 +42,13 @@ export const test = base.extend<{ dubShaGuard: void }>({
       const expected = process.env.DUB_SHA ?? '';
       let moved: DubPreviewMoved | undefined;
       if (expected) guard(page, expected, (e) => { moved ??= e; });
+      // A spec that only uses `request` never opens the page, but Playwright
+      // still records its context: one blank white frame. Say so, and the
+      // reporter leaves that video out of the evidence.
+      let navigated = false;
+      page.on('framenavigated', (f) => { if (f === page.mainFrame() && f.url() !== 'about:blank') navigated = true; });
       await use();
+      if (!navigated) testInfo.annotations.push({ type: 'dub:no_page', description: 'the spec never opened a page' });
       if (moved) {
         testInfo.annotations.push({ type: 'dub:preview_moved', description: moved.message });
         throw moved;
