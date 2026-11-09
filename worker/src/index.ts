@@ -1,7 +1,8 @@
 // The Dub Worker: bundle intake (OIDC), access-checked serving, verdicts,
 // webhooks, App OAuth, and the placeholder review page. The per-PR state is
 // in `do/pr.ts`.
-import type { Bundle, BundleCriterion, Criterion, Env, Meta } from './types';
+import type { Bundle, BundleCriterion, Criterion, Env, Meta, Summary } from './types';
+import { generateSummary } from './lib/summary';
 import { PullRequest, type FullState, type PRId } from './do/pr';
 import { AppAuth, GitHub, GitHubError, atLeast, type Permission } from './lib/github';
 import { OidcError, verifyActionsToken } from './lib/oidc';
@@ -72,6 +73,8 @@ async function route(req: Request, env: Env): Promise<Response> {
   if (p === '/api/bundles' && m === 'POST') return intake(req, env);
   if (p === '/api/verdicts' && m === 'POST') return submitVerdict(req, env);
   if (p === '/api/prs' && m === 'POST') return createPR(req, env);
+  if (p === '/api/summaries' && m === 'POST') return summarise(req, env);
+  if (p === '/api/reruns' && m === 'POST') return rerun(req, env);
 
   let mm: RegExpExecArray | null;
   if ((mm = /^\/r\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/.exec(p)) && m === 'GET') {
@@ -452,6 +455,94 @@ export function servingHeaders(name: string): Record<string, string> {
 
 // ---- serving ---------------------------------------------------------------
 
+/** The author may not review their own PR unless the repo opts in for dogfooding. */
+function isOwnPR(config: DubConfig, author: string | null | undefined, login: string): boolean {
+  if (config.allow_self_review) return false;
+  return (author ?? '').toLowerCase() === login.toLowerCase();
+}
+
+async function loadSummary(env: Env, id: PRId, sha: string, bundleId: string): Promise<Summary | undefined> {
+  const obj = await env.BUNDLES.get(`${prefix(id, sha, bundleId)}/summary.json`);
+  return obj ? ((await obj.json()) as Summary) : undefined;
+}
+
+/** A pending record older than this is treated as abandoned and rewritten. */
+const SUMMARY_STALE_MS = 6 * 60_000;
+
+/**
+ * Writes the summary for a bundle on demand. The first viewer's browser asks
+ * for it and keeps the request open while Claude reads the diff; anyone else
+ * who arrives meanwhile gets `pending` back and polls. Needs read access.
+ */
+async function summarise(req: Request, env: Env): Promise<Response> {
+  const user = await requireUser(req, env);
+  const body = (await req.json().catch(() => null)) as { owner?: string; repo?: string; pr?: number; sha?: string; bundle_id?: string; force?: boolean } | null;
+  if (!body) throw new HttpError(400, 'JSON body required');
+  for (const k of ['owner', 'repo', 'pr', 'sha', 'bundle_id'] as const) if (!body[k]) throw new HttpError(400, `${k} required`);
+  if (!/^[0-9a-f]{7,40}$/i.test(String(body.sha)) || !/^[0-9A-Za-z]+$/.test(String(body.bundle_id))) throw new HttpError(400, 'bad sha or bundle_id');
+  const id: PRId = { owner: body.owner!, repo: body.repo!, number: Number(body.pr) };
+  await requirePermission(env, user, id, 'read');
+  if (!env.ANTHROPIC_API_KEY) return json({ status: 'skipped' });
+
+  const key = `${prefix(id, body.sha!, body.bundle_id!)}/summary.json`;
+  const existing = (await env.BUNDLES.get(key).then((o) => (o ? o.json() : null))) as Summary | null;
+  if (existing && !body.force) {
+    if (existing.status !== 'pending') return json(existing);
+    if (Date.now() - Date.parse(existing.started_at ?? '') < SUMMARY_STALE_MS) return json(existing);
+  }
+  const bundleObj = await env.BUNDLES.get(`${prefix(id, body.sha!, body.bundle_id!)}/dub.json`);
+  if (!bundleObj) throw new HttpError(404, 'no such bundle');
+  const bundle = (await bundleObj.json()) as Bundle;
+
+  const pending: Summary = { status: 'pending', started_at: new Date().toISOString() };
+  await env.BUNDLES.put(key, JSON.stringify(pending), { httpMetadata: { contentType: 'application/json' } });
+  let result: Summary;
+  try {
+    const tok = await app(env).installationToken(id.owner, id.repo);
+    const [pr, files] = await Promise.all([gh.getPR(tok, id.owner, id.repo, id.number), gh.prFiles(tok, id.owner, id.repo, id.number)]);
+    result = await generateSummary(
+      { owner: id.owner, repo: id.repo, number: id.number, title: pr.title ?? '', body: pr.body ?? null, brief: bundle.brief?.text ?? '', files },
+      { apiKey: env.ANTHROPIC_API_KEY },
+    );
+  } catch (e) {
+    result = { status: 'error', started_at: pending.started_at, generated_at: new Date().toISOString(), error: e instanceof Error ? e.message : String(e) };
+  }
+  await env.BUNDLES.put(key, JSON.stringify(result), { httpMetadata: { contentType: 'application/json' } });
+  return json(result, result.status === 'error' ? 502 : 200);
+}
+
+/**
+ * Re-runs the capture workflow for a commit: the newest completed
+ * pull_request run of the publishing workflow on that head SHA. The App needs
+ * Actions: write. Only someone who could record a verdict may ask.
+ */
+async function rerun(req: Request, env: Env): Promise<Response> {
+  const user = await requireUser(req, env);
+  const body = (await req.json().catch(() => null)) as { owner?: string; repo?: string; pr?: number; sha?: string } | null;
+  if (!body) throw new HttpError(400, 'JSON body required');
+  for (const k of ['owner', 'repo', 'pr', 'sha'] as const) if (!body[k]) throw new HttpError(400, `${k} required`);
+  if (!/^[0-9a-f]{40}$/i.test(String(body.sha))) throw new HttpError(400, 'sha must be a full commit SHA');
+  const id: PRId = { owner: body.owner!, repo: body.repo!, number: Number(body.pr) };
+  await requirePermission(env, user, id, 'write');
+  const { config } = await repoConfig(env, id);
+  if (!config.reviewers.includes(user.login.toLowerCase())) throw new HttpError(403, `@${user.login} is not in .dub/config.yml reviewers`);
+
+  const tok = await app(env).installationToken(id.owner, id.repo);
+  const runs = (await gh.workflowRuns(tok, id.owner, id.repo, { event: 'pull_request', head_sha: body.sha! }))
+    .filter((r) => !config.publish_workflow || r.path.toLowerCase().endsWith('/' + config.publish_workflow.toLowerCase()))
+    .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+  const run = runs[0];
+  if (!run) throw new HttpError(404, `no pull_request workflow run found for ${body.sha!.slice(0, 7)}`);
+  if (run.status !== 'completed') return json({ error: 'a run is already in progress', run_id: run.id, html_url: run.html_url }, 409);
+  try {
+    await gh.rerunWorkflowRun(tok, id.owner, id.repo, run.id);
+  } catch (e) {
+    if (e instanceof GitHubError && e.status === 403) throw new HttpError(403, 'GitHub refused the re-run. The Dub GitHub App needs the Actions: read and write permission (see docs/setup.md).');
+    throw e;
+  }
+  return json({ run_id: run.id, html_url: run.html_url }, 202);
+}
+
 async function loadBundle(env: Env, id: PRId, sha: string, bundleId: string): Promise<{ bundle: Bundle; meta: Meta } | null> {
   const pre = prefix(id, sha, bundleId);
   const [b, m] = await Promise.all([env.BUNDLES.get(`${pre}/dub.json`), env.BUNDLES.get(`${pre}/meta.json`)]);
@@ -495,8 +586,8 @@ async function reviewPage(req: Request, env: Env, id: PRId, sha: string | null):
   if (!loaded) return renderSimple('Bundle missing', '<p>The bundle is recorded but its files are missing from storage.</p>', 500);
   const { config } = await repoConfig(env, id);
   const effective = state.verdicts.filter((v) => v.sha === pick.sha).sort((a, b) => b.seq - a.seq)[0] ?? null;
-  const can_review =
-    atLeast(perm, 'write') && config.reviewers.includes(user.login.toLowerCase()) && state.pr.author?.toLowerCase() !== user.login.toLowerCase();
+  const can_review = atLeast(perm, 'write') && config.reviewers.includes(user.login.toLowerCase()) && !isOwnPR(config, state.pr.author, user.login);
+  const summary = env.ANTHROPIC_API_KEY ? await loadSummary(env, id, pick.sha, pick.bundle_id) : null;
   const html = renderReviewPage({
     owner: id.owner,
     repo: id.repo,
@@ -506,6 +597,7 @@ async function reviewPage(req: Request, env: Env, id: PRId, sha: string | null):
     head_sha: state.pr.head_sha,
     bundle: loaded.bundle,
     meta: loaded.meta,
+    summary,
     bundle_base: `/api/bundles/${id.owner}/${id.repo}/${id.number}/${pick.sha}/${pick.bundle_id}`,
     verdicts: state.verdicts,
     failed_deliveries: state.deliveries.filter((d) => d.state === 'failed').map((d) => ({ effect: d.effect, last_error: d.last_error })),
@@ -588,7 +680,7 @@ async function submitVerdict(req: Request, env: Env): Promise<Response> {
     await stub.recordWebhook(id, { action: 'sync', head_sha: pr.head.sha, author: pr.user.login, open: pr.state === 'open' });
     state = await stub.state(id);
   }
-  if (state.pr.author?.toLowerCase() === user.login.toLowerCase()) throw new HttpError(403, 'the PR author cannot be its reviewer');
+  if (isOwnPR(config, state.pr.author, user.login)) throw new HttpError(403, 'the PR author cannot be its reviewer (allow_self_review is off)');
   void perm;
 
   const result = await stub.submitVerdict(id, {

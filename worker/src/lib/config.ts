@@ -14,6 +14,8 @@ export interface DubConfig {
   close_on_reject: boolean;
   /** When set, only OIDC tokens minted by this workflow file may upload bundles. */
   publish_workflow: string | null;
+  /** Lets a reviewer accept their own PR. Off by default; on for dogfooding. */
+  allow_self_review: boolean;
 }
 
 export type Areas = Record<string, string[]>;
@@ -69,6 +71,7 @@ export function parseConfig(text: string | null | undefined): DubConfig {
     preview_origin_allowlist: list(y.preview_origin_allowlist),
     close_on_reject: bool(y.close_on_reject, true),
     publish_workflow: typeof y.publish_workflow === 'string' && y.publish_workflow ? y.publish_workflow.replace(/^\.github\/workflows\//, '') : null,
+    allow_self_review: bool(y.allow_self_review, false),
   };
 }
 

@@ -19,6 +19,7 @@ export default defineConfig({
           SESSION_SECRET: 'session-secret-test-session-secret-test',
           PUBLIC_URL: 'https://dub.test',
           ALLOWED_ORIGINS: 'https://dub.test',
+          ANTHROPIC_API_KEY: 'sk-ant-test',
         },
       },
     }),

@@ -23,7 +23,7 @@ reconciled. When this file and the spec disagree, this file wins.
 | 13 | **Header and endpoint from one source.** The runner's fixture checks `x-dub-sha` on every document response; a mismatch turns the remaining criteria into `error` with `preview_moved`. |
 | 14 | **Spec imports are copied verbatim.** Relative imports only, resolution stops at `node_modules`, and the bundle lists every inlined file with its sha256. |
 | 15 | Reconciler backoff: 30s doubling, capped at 1h, give up after 24h. On give-up the delivery is `failed` and surfaced in the sticky comment and the page header. Status PUTs may retry forever within the window; close and comment use the stored ids. |
-| 16 | **Pilot scope:** the data model supports many reviewers and bundles; the page shows one reviewer flow and the newest bundle per SHA only. No rerun UI, no multi-bundle picker. |
+| 16 | **Pilot scope:** the data model supports many reviewers and bundles; the page shows one reviewer flow and the newest bundle per SHA only. No multi-bundle picker. (A rerun button was added later, decision 27.) |
 
 The Missive workflow already has a workflow-level concurrency group; it stays.
 
@@ -39,6 +39,15 @@ The Missive workflow already has a workflow-level concurrency group; it stays.
 | 22 | **OAuth state is bound to the browser** by a `dub_oauth` nonce cookie (`Path=/auth`, 10 minutes) that must match the signed state at the callback. |
 | 23 | **Verdict submissions carry an `idempotency_key`** (UUID per form submission, regenerated after a success). Required from the page (cookie sessions), optional from the API. A replay returns the original result with `replayed: true` and records no new event. |
 | 24 | **The publishing workflow is enforced.** The OIDC `job_workflow_ref` must start with `<repository>/.github/workflows/`; if `.dub/config.yml` sets `publish_workflow: review-app.yml`, the file name must match. |
+
+### Added after the first pilot review (the page)
+
+| # | Decision |
+|---|---|
+| 25 | **The page leads with a summary written from the diff, not with the agent's criteria.** On the first view of a bundle the Worker asks Claude (`claude-opus-5-5`, structured output) for `what_changed`, `key_changes[]`, `test_plan[]` (steps with an app path each) and `worth_a_look[]`, from the PR title and body, the brief, and the PR's file patches (small files first, 160k characters of patch at most). It is stored as `summary.json` next to the bundle and never regenerated unless a viewer asks after an error. The agent's criteria and evidence stay on the page as a collapsed "Agent's checks" panel with a line saying who wrote them. Without `ANTHROPIC_API_KEY` the page shows the diff stats and a link instead. |
+| 26 | **The preview opens in a side drawer** (an iframe of `preview.url`, which must be `https`), with a path box, reload and open-in-tab. Each test-plan step with a path opens the drawer there. The host app has to allow framing from `https://dubthee.dev` (`frame-ancestors`) and send its session cookie with `SameSite=None; Secure` on review apps, or the drawer shows the app's own refusal and the viewer uses the tab link. Nothing on the page depends on the drawer working. |
+| 27 | **"Run checks again" re-runs the capture workflow.** `POST /api/reruns` finds the newest completed `pull_request` run of the publishing workflow on the bundle's head SHA and asks GitHub to re-run it; the page then polls `/api/prs/…` and reloads when a newer complete bundle for that SHA arrives. Needs the App permission **Actions: R/W**; without it GitHub answers 403 and the page says which permission is missing. Reviewers only. |
+| 28 | **`allow_self_review: true` in `.dub/config.yml` lets the PR author record the verdict.** Off by default; on for dogfooding a repo where one person writes the briefs and reviews them. |
 
 ## Layout of this repo
 
@@ -58,6 +67,7 @@ docs/               spec, feedback, this contract, setup
 - Every response carries `x-dub-sha: <40 hex>` (omitted when unset).
 - `POST /dev/reset` (review apps only, 404 elsewhere) truncates every table except `schema_migrations` and re-runs the review seed. Returns `200 {"ok":true}`. Idempotent. POST only.
 - Existing: `/dev/mailbox`, `/dev/deliver`, four accounts with `review_password_123`.
+- Review apps may be framed by the review page (decision 26): `content-security-policy` says `frame-ancestors 'self' https://dubthee.dev` (plus `http://localhost:8787` on review apps) and the session cookie is `SameSite=None; Secure`, so signing in inside the drawer works where the browser allows third-party cookies. Production keeps `frame-ancestors 'self'` and `SameSite=Lax`.
 
 ## Brief (`.dub/briefs/<slug>.md`)
 
@@ -129,6 +139,8 @@ As in the spec, with these clarifications:
 | `GET /api/prs/:owner/:repo/:n` | session, repo read | `{head_sha, bundles:[…], verdicts:[…], deliveries:[…], reopen_seq}` |
 | `GET /api/bundles/:owner/:repo/:n/:sha/:bundle_id/*` | session, repo read | Bundle files from R2, sandboxed (decision 17). |
 | `POST /api/verdicts` | session, reviewer | `{owner, repo, pr, sha, bundle_id, verdict: dub|revise|reject, note, suggest_rule, used: [...], because: [...], idempotency_key}` → appends event, runs effects, returns effective state (`201`; `200` with `replayed: true` on a replay). |
+| `POST /api/summaries` | session, repo read | `{owner, repo, pr, sha, bundle_id, force?}` → writes `summary.json` for the bundle if missing (decision 25) and returns it; `pending` while another request is writing it, `502` with `status: error` when the model failed. |
+| `POST /api/reruns` | session, reviewer | `{owner, repo, pr, sha}` → re-runs the newest completed capture run for that SHA (decision 27). `202 {run_id, html_url}`; `409` if one is in progress; `403` naming the missing App permission. |
 | `POST /api/prs` | session (`dub pr`) | `{owner, repo, head, base, title, body}` → PR created by the App. Returns `{number, url}`. |
 | `POST /webhooks/github` | HMAC | `pull_request` `opened|synchronize|reopened|closed`. |
 | `GET /auth/login`, `/auth/callback`, `GET /auth/token` | — | App user-to-server OAuth; `/auth/token` issues a CLI token for the signed-in user. |
@@ -143,7 +155,7 @@ Effective verdict for a SHA = highest `seq` for that SHA. Effects per event: `re
 
 ## GitHub App
 
-Permissions: Pull requests R/W, Commit statuses R/W, Contents R (rubric, PR creation needs Contents R only; the branch is already pushed), Metadata R. Events: `pull_request`. OAuth user-to-server enabled, callback `https://dubthee.dev/auth/callback`. Secrets in the Worker: `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET`, `SESSION_SECRET`.
+Permissions: Pull requests R/W, Commit statuses R/W, Contents R (rubric, PR creation needs Contents R only; the branch is already pushed), Actions R/W (re-runs), Metadata R. Events: `pull_request`. OAuth user-to-server enabled, callback `https://dubthee.dev/auth/callback`. Secrets in the Worker: `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET`, `SESSION_SECRET`, and optionally `ANTHROPIC_API_KEY` for the summaries.
 
 ## Repo config (`.dub/config.yml` on the base branch)
 
@@ -153,4 +165,5 @@ base: main
 preview_origin_allowlist: [https://dubthee.dev]
 close_on_reject: true       # a Reject closes the PR (default); false records it only
 publish_workflow: review-app.yml   # optional: only this workflow may upload bundles
+allow_self_review: false    # true lets the PR author record the verdict (dogfooding)
 ```

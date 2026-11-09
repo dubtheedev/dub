@@ -117,10 +117,57 @@ export interface PR {
   base: { sha: string; ref: string };
   user: { login: string };
   html_url: string;
+  title?: string;
+  body?: string | null;
+}
+
+export interface PRFile {
+  filename: string;
+  status: 'added' | 'removed' | 'modified' | 'renamed' | 'copied' | 'changed' | 'unchanged';
+  additions: number;
+  deletions: number;
+  patch?: string;
+  previous_filename?: string;
+}
+
+export interface WorkflowRun {
+  id: number;
+  path: string;
+  event: string;
+  head_sha: string;
+  status: 'queued' | 'in_progress' | 'completed' | string;
+  conclusion: string | null;
+  html_url: string;
+  created_at: string;
 }
 
 export class GitHub {
   constructor(private fetchFn: Fetch = lazyFetch) {}
+
+  /** Every file in the PR with its patch, up to 300 files (GitHub's own cap). */
+  async prFiles(token: string, owner: string, repo: string, n: number): Promise<PRFile[]> {
+    const out: PRFile[] = [];
+    for (let page = 1; page <= 3; page++) {
+      const batch = await ghJson<PRFile[]>(this.fetchFn, `/repos/${owner}/${repo}/pulls/${n}/files?per_page=100&page=${page}`, { token });
+      out.push(...batch);
+      if (batch.length < 100) break;
+    }
+    return out;
+  }
+
+  /** Workflow runs for one commit, newest first. */
+  async workflowRuns(token: string, owner: string, repo: string, q: { event?: string; head_sha?: string }): Promise<WorkflowRun[]> {
+    const params = new URLSearchParams({ per_page: '30' });
+    if (q.event) params.set('event', q.event);
+    if (q.head_sha) params.set('head_sha', q.head_sha);
+    const r = await ghJson<{ workflow_runs: WorkflowRun[] }>(this.fetchFn, `/repos/${owner}/${repo}/actions/runs?${params}`, { token });
+    return r.workflow_runs ?? [];
+  }
+
+  /** Re-run every job of a completed run. Needs Actions: write on the App. */
+  async rerunWorkflowRun(token: string, owner: string, repo: string, runId: number): Promise<void> {
+    await ghRaw(this.fetchFn, `/repos/${owner}/${repo}/actions/runs/${runId}/rerun`, { token, method: 'POST' });
+  }
 
   getPR(token: string, owner: string, repo: string, n: number): Promise<PR> {
     return ghJson<PR>(this.fetchFn, `/repos/${owner}/${repo}/pulls/${n}`, { token });

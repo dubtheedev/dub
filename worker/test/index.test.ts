@@ -184,8 +184,14 @@ describe('review page and API', () => {
     expect(html).toContain('Assertions passed');
     expect(html).toContain(`/api/bundles/o/r/1/${SHA_A}/${BUNDLE_1}/ac-1/list.png`);
     expect(html).toContain('Plain tone');
-    expect(html).toContain('Brief order: <b>unknown</b>');
+    expect(html).toContain('brief order unknown');
     expect(html).toContain('<form id="verdict" >');
+    // The brief is rendered, not dumped; the agent's checks are a demoted panel; the summary is still being written.
+    expect(html).toContain('<h3>Send a reminder when an invoice is 7 days overdue</h3>');
+    expect(html).toContain('<strong>Why:</strong>');
+    expect(html).toContain("Agent's checks <span class=\"muted\">1 passed, 1 without evidence");
+    expect(html).toContain('id="summary-pending"');
+    expect(html).toContain('id="toggle-drawer"');
     expect(html).not.toContain('<script>alert');
     // Bundle files need the same access.
     const file = await SELF.fetch(`https://dub.test/api/bundles/o/r/1/${SHA_A}/${BUNDLE_1}/ac-1/list.png`, { headers: { cookie: await cookieFor('reader') } });
@@ -234,6 +240,76 @@ describe('review page and API', () => {
     expect(html).not.toContain('<script>alert');
     expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
     expect(html).toContain('&lt;img src=x onerror=alert(1)&gt;');
+  });
+});
+
+describe('summary', () => {
+  it('writes the summary from the PR diff on request, stores it, and renders it on the page', async () => {
+    await upload(bundle());
+    const body = { owner: 'o', repo: 'r', pr: 1, sha: SHA_A, bundle_id: BUNDLE_1 };
+    const headers = { 'content-type': 'application/json', cookie: await cookieFor('reader'), origin: 'https://dub.test' };
+    const res = await SELF.fetch('https://dub.test/api/summaries', { method: 'POST', headers, body: JSON.stringify(body) });
+    expect(res.status).toBe(200);
+    const sum = (await res.json()) as { status: string; test_plan: { path: string }[]; model: string };
+    expect(sum.status).toBe('done');
+    expect(sum.test_plan[0]!.path).toBe('/invoices');
+    // The model saw the diff, the brief and the PR, and was asked for JSON.
+    const call = gh.anthropicCalls[0] as { model: string; output_config: { format: { type: string } }; messages: { content: string }[]; fallbacks: string };
+    expect(call.model).toBe('claude-opus-5-5');
+    expect(call.output_config.format.type).toBe('json_schema');
+    expect(call.fallbacks).toBe('default');
+    expect(call.messages[0]!.content).toContain('lib/invoices.ex');
+    expect(call.messages[0]!.content).toContain('Send a reminder when an invoice');
+    // Stored once; a second request is served from storage.
+    const again = await SELF.fetch('https://dub.test/api/summaries', { method: 'POST', headers, body: JSON.stringify(body) });
+    expect(again.status).toBe(200);
+    expect(gh.anthropicCalls).toHaveLength(1);
+    const page = await (await SELF.fetch('https://dub.test/r/o/r/pull/1', { headers: { accept: 'text/html', cookie: await cookieFor('ryan') } })).text();
+    expect(page).toContain('Adds a <strong>reminder badge</strong>');
+    expect(page).toContain('<b>Badge on the invoice list</b>');
+    expect(page).toContain('data-path="/invoices"');
+    expect(page).toContain('The cutoff ignores the customer timezone.');
+    expect(page).not.toContain('id="summary-pending"');
+    // Needs read access like everything else.
+    expect((await SELF.fetch('https://dub.test/api/summaries', { method: 'POST', headers: { ...headers, cookie: await cookieFor('nobody') }, body: JSON.stringify(body) })).status).toBe(403);
+  });
+
+  it('records an error when the model fails and lets the page retry it', async () => {
+    await upload(bundle());
+    gh.anthropic = () => ({ status: 400, body: { type: 'error', error: { type: 'invalid_request_error', message: 'boom' } } });
+    const body = { owner: 'o', repo: 'r', pr: 1, sha: SHA_A, bundle_id: BUNDLE_1 };
+    const headers = { 'content-type': 'application/json', cookie: await cookieFor('ryan'), origin: 'https://dub.test' };
+    const res = await SELF.fetch('https://dub.test/api/summaries', { method: 'POST', headers, body: JSON.stringify(body) });
+    expect(res.status).toBe(502);
+    expect(((await res.json()) as { status: string }).status).toBe('error');
+    const page = await (await SELF.fetch('https://dub.test/r/o/r/pull/1', { headers: { accept: 'text/html', cookie: await cookieFor('ryan') } })).text();
+    expect(page).toContain('The summary could not be written');
+    expect(page).toContain('id="summary-retry"');
+    gh.anthropicCalls = [];
+    gh.anthropic = new FakeGitHub().anthropic;
+    const retry = await SELF.fetch('https://dub.test/api/summaries', { method: 'POST', headers, body: JSON.stringify({ ...body, force: true }) });
+    expect(retry.status).toBe(200);
+    expect(gh.anthropicCalls).toHaveLength(1);
+  });
+});
+
+describe('reruns', () => {
+  it('re-runs the newest completed run of the publishing workflow for a reviewer', async () => {
+    await upload(bundle());
+    gh.on('GET /repos/o/r/contents/.dub/config.yml', () => ({ body: { encoding: 'base64', sha: 'c', content: btoa('reviewers: [ryan]\npublish_workflow: review-app.yml\n') } }));
+    const body = JSON.stringify({ owner: 'o', repo: 'r', pr: 1, sha: SHA_A });
+    const headers = { 'content-type': 'application/json', origin: 'https://dub.test' };
+    expect((await SELF.fetch('https://dub.test/api/reruns', { method: 'POST', headers: { ...headers, cookie: await cookieFor('reader') }, body })).status).toBe(403);
+    const res = await SELF.fetch('https://dub.test/api/reruns', { method: 'POST', headers: { ...headers, cookie: await cookieFor('ryan') }, body });
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ run_id: 42, html_url: 'https://github.com/o/r/actions/runs/42' });
+    expect(gh.of('POST', '/repos/o/r/actions/runs/42/rerun')).toHaveLength(1);
+    expect(gh.of('POST', '/repos/o/r/actions/runs/41/rerun')).toHaveLength(0);
+    // A missing App permission is explained.
+    gh.on('POST /repos/o/r/actions/runs/*/rerun', () => ({ status: 403, body: { message: 'Resource not accessible by integration' } }));
+    const denied = await SELF.fetch('https://dub.test/api/reruns', { method: 'POST', headers: { ...headers, cookie: await cookieFor('ryan') }, body });
+    expect(denied.status).toBe(403);
+    expect(((await denied.json()) as { error: string }).error).toMatch(/Actions: read and write/);
   });
 });
 
@@ -287,6 +363,15 @@ describe('verdicts', () => {
     expect((await post(await cookieFor('ryan'), { idempotency_key: 'not-a-uuid' })).status).toBe(400);
     expect((await post(await cookieFor('ryan'), { bundle_id: BUNDLE_2 })).status).toBe(422);
     expect(gh.of('POST', '/repos/o/r/pulls/1/reviews')).toHaveLength(0);
+  });
+
+  it('lets the author review their own PR when the repo allows self review', async () => {
+    await upload(bundle());
+    gh.on('GET /repos/o/r/collaborators/*/permission', () => ({ body: { permission: 'admin' } }));
+    gh.on('GET /repos/o/r/contents/.dub/config.yml', () => ({ body: { encoding: 'base64', sha: 'c', content: btoa('reviewers: [ryan, agent-app[bot]]\nallow_self_review: true\n') } }));
+    const page = await (await SELF.fetch('https://dub.test/r/o/r/pull/1', { headers: { accept: 'text/html', cookie: await cookieFor('agent-app[bot]') } })).text();
+    expect(page).toContain('<form id="verdict" >');
+    expect((await post(await cookieFor('agent-app[bot]'))).status).toBe(201);
   });
 });
 

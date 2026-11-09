@@ -23,7 +23,7 @@ the org that owns `deeptreecorp/missive` so it can be installed there.
 | Callback URL | `https://dubthee.dev/auth/callback` |
 | Request user authorization (OAuth) during installation | off |
 | Webhook | active, URL `https://dubthee.dev/webhooks/github`, a fresh secret |
-| Repository permissions | Pull requests **R/W**, Commit statuses **R/W**, Contents **R**, Metadata **R** |
+| Repository permissions | Pull requests **R/W**, Commit statuses **R/W**, Contents **R**, Actions **R/W** (for "Run checks again"), Metadata **R** |
 | Subscribe to events | **Pull request** |
 | Where can this App be installed | Only on this account |
 
@@ -50,6 +50,7 @@ npx wrangler secret put GITHUB_WEBHOOK_SECRET
 npx wrangler secret put GITHUB_OAUTH_CLIENT_ID     # Iv1.…
 npx wrangler secret put GITHUB_OAUTH_CLIENT_SECRET
 npx wrangler secret put SESSION_SECRET             # openssl rand -hex 32
+npx wrangler secret put ANTHROPIC_API_KEY          # optional: the page's "what changed" summary (claude-opus-5-5)
 
 npx wrangler deploy
 ```

@@ -142,4 +142,24 @@ export interface Env {
   GITHUB_OAUTH_CLIENT_ID: string;
   GITHUB_OAUTH_CLIENT_SECRET: string;
   SESSION_SECRET: string;
+  /** Optional. Without it the Worker writes no summaries and the page says so. */
+  ANTHROPIC_API_KEY?: string;
+}
+
+/**
+ * The reviewer-facing summary, written by Claude from the PR diff at the
+ * first page view and stored as `summary.json` next to the bundle.
+ * `pending` carries `started_at` so a stuck generation can be retried.
+ */
+export interface Summary {
+  status: 'pending' | 'done' | 'error';
+  started_at?: string;
+  generated_at?: string;
+  model?: string;
+  input?: { files: number; patch_chars: number; truncated: boolean };
+  what_changed?: string;
+  key_changes?: { title: string; detail: string; files: string[] }[];
+  test_plan?: { step: string; expect: string; path: string | null }[];
+  worth_a_look?: string[];
+  error?: string;
 }
