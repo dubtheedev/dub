@@ -33,6 +33,13 @@ export interface WebhookInput {
   head_sha: string;
   author: string;
   open: boolean;
+  /**
+   * Whether the head has a brief under `.dub/briefs/`. `false` means this is
+   * not a Dub PR: the row is kept but no pending status or sticky comment is
+   * written, so a plain human PR never shows a `dubbed` that can't resolve.
+   * Omitted (unknown) behaves like `true`.
+   */
+  has_brief?: boolean;
 }
 
 export interface ReserveInput {
@@ -269,6 +276,7 @@ export class PullRequest extends DurableObject<Env> {
       case 'opened':
       case 'synchronize': {
         sql.exec(`UPDATE pr SET head_sha = ?, author = ?, open = 1 WHERE k = 1`, w.head_sha, w.author);
+        if (w.has_brief === false) break;
         // The head moved: a pending status with a link tells the human what's
         // happening during the deploy window (feedback: smaller gaps, 1).
         this.enqueue(0, 'pending_status', w.head_sha, now);
@@ -284,6 +292,7 @@ export class PullRequest extends DurableObject<Env> {
           w.author,
           maxSeq,
         );
+        if (w.has_brief === false) break;
         this.enqueue(0, 'pending_status', w.head_sha, now);
         await this.runPending();
         break;

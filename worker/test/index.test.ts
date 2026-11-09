@@ -74,6 +74,19 @@ describe('webhooks', () => {
     const other = await SELF.fetch('https://dub.test/webhooks/github', { method: 'POST', headers: { 'x-github-event': 'issues', 'x-hub-signature-256': sig }, body: payload });
     expect(other.status).toBe(204);
   });
+
+  it('leaves a PR without a brief alone: no pending status, no sticky comment', async () => {
+    gh.on('GET /repos/o/r/contents/.dub/briefs', () => ({ status: 404, body: { message: 'Not Found' } }));
+    const payload = JSON.stringify({ action: 'opened', number: 1, repository: { name: 'r', owner: { login: 'o' } }, pull_request: { head: { sha: SHA_B }, user: { login: 'human' }, state: 'open' } });
+    const sig = 'sha256=' + (await hmacHex(env.GITHUB_WEBHOOK_SECRET, new TextEncoder().encode(payload)));
+    const ok = await SELF.fetch('https://dub.test/webhooks/github', { method: 'POST', headers: { 'x-github-event': 'pull_request', 'x-hub-signature-256': sig }, body: payload });
+    expect(ok.status).toBe(200);
+    expect(gh.of('POST', `/repos/o/r/statuses/${SHA_B}`)).toHaveLength(0);
+    expect(gh.of('POST', '/repos/o/r/issues/1/comments')).toHaveLength(0);
+    // The PR is still known, so a later bundle or a brief added in a push works as before.
+    const state = (await (await SELF.fetch('https://dub.test/api/prs/o/r/1', { headers: { cookie: await cookieFor('reader') } })).json()) as { head_sha: string };
+    expect(state.head_sha).toBe(SHA_B);
+  });
 });
 
 describe('bundle intake', () => {

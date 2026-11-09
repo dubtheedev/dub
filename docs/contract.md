@@ -14,7 +14,7 @@ reconciled. When this file and the spec disagree, this file wins.
 | 4 | **You push the branch as yourself; `dub pr` creates the PR as the App** through one Worker endpoint. Branch protection: "Require approval of the most recent reviewable push" OFF, "Require branches to be up to date" OFF, "Dismiss stale reviews" ON. |
 | 5 | `fetch-depth: 0` is required for provenance; without full history `first_seen_sha` is `unknown`. |
 | 6 | **`/__dub/version` sends CORS for `https://dubthee.dev`** (and `http://localhost:8787` in review apps) and sits outside every auth pipeline. **Every response also carries `x-dub-sha`**, set by one endpoint plug. Both read `GIT_SHA`, baked at build and read once at boot. |
-| 7 | `synchronize` sets `dubbed: pending` on the new head immediately, description "Waiting for evidence bundle", target the review page. |
+| 7 | `synchronize` sets `dubbed: pending` on the new head immediately, description "Waiting for evidence bundle", target the review page (only when the head has a brief, decision 29). |
 | 8 | `pull_request.closed` is subscribed; the DO marks pending deliveries `superseded` and cancels its alarm. |
 | 9 | **Judgment specs never assert.** The runner reports any failed expectation in a `judgment` criterion as `error`, never `fail`. The skill says so. |
 | 10 | Criterion ids are stable; the skill forbids renumbering. |
@@ -48,6 +48,7 @@ The Missive workflow already has a workflow-level concurrency group; it stays.
 | 26 | **The preview opens in a side drawer** (an iframe of `preview.url`, which must be `https`), with a path box, reload and open-in-tab. Each test-plan step with a path opens the drawer there. The host app has to allow framing from `https://dubthee.dev` (`frame-ancestors`) and send its session cookie with `SameSite=None; Secure` on review apps, or the drawer shows the app's own refusal and the viewer uses the tab link. Nothing on the page depends on the drawer working. |
 | 27 | **"Run checks again" re-runs the capture workflow.** `POST /api/reruns` finds the newest completed `pull_request` run of the publishing workflow on the bundle's head SHA and asks GitHub to re-run it; the page then polls `/api/prs/…` and reloads when a newer complete bundle for that SHA arrives. Needs the App permission **Actions: R/W**; without it GitHub answers 403 and the page says which permission is missing. Reviewers only. |
 | 28 | **`allow_self_review: true` in `.dub/config.yml` lets the PR author record the verdict.** Off by default; on for dogfooding a repo where one person writes the briefs and reviews them. |
+| 29 | **A PR without a brief is not a Dub PR.** On `opened`, `synchronize` and `reopened` the Worker lists `.dub/briefs/` at the head SHA; when there is no `*.md` there it records the head but writes no pending `dubbed` and no sticky comment, so a plain human PR never shows a status that cannot resolve. A later push that adds a brief, or a bundle arriving, turns the PR into a Dub PR as before. If the check itself fails the Worker assumes a brief. |
 
 ## Layout of this repo
 

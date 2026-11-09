@@ -259,6 +259,21 @@ export class GitHub {
     }
   }
 
+  /** Names of the entries in a directory at a ref; null when the directory does not exist. */
+  async listDir(token: string, owner: string, repo: string, path: string, ref: string): Promise<string[] | null> {
+    try {
+      const res = await ghJson<{ name: string; type: string }[] | { type: string }>(
+        this.fetchFn,
+        `/repos/${owner}/${repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${encodeURIComponent(ref)}`,
+        { token },
+      );
+      return Array.isArray(res) ? res.map((e) => e.name) : null;
+    } catch (e) {
+      if (e instanceof GitHubError && e.status === 404) return null;
+      throw e;
+    }
+  }
+
   /** Base branch head SHA. */
   async branchSha(token: string, owner: string, repo: string, branch: string): Promise<string | null> {
     try {

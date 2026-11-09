@@ -47,6 +47,7 @@ export class FakeGitHub {
     this.on('GET /repos/o/r/collaborators/*/permission', (c) => ({ body: { permission: c.path.includes('/ryan/') ? 'write' : c.path.includes('/reader/') ? 'read' : 'none' } }));
     this.on('GET /repos/o/r/contents/.dub/config.yml', () => ({ body: { encoding: 'base64', sha: 'c', content: btoa('reviewers: [ryan]\nbase: main\n') } }));
     this.on('GET /repos/o/r/contents/.dub/rubric.md', () => ({ body: { encoding: 'base64', sha: 'r', content: btoa('## Plain tone\nScope: email\n\n## Empty states everywhere\n') } }));
+    this.on('GET /repos/o/r/contents/.dub/briefs', () => ({ body: [{ name: 'invoice-reminders.md', type: 'file' }] }));
     this.on('GET /repos/o/r/branches/main', () => ({ body: { commit: { sha: 'base-sha' } } }));
     this.on('GET /user', () => ({ body: { login: 'ryan', id: 1 } }));
     this.on('GET /repos/o/r/pulls/1/files', () => ({
