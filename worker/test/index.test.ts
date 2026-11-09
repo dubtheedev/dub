@@ -189,7 +189,7 @@ describe('review page and API', () => {
     const reader = await SELF.fetch('https://dub.test/r/o/r/pull/1', { headers: { accept: 'text/html', cookie: await cookieFor('reader') } });
     expect(reader.status).toBe(200);
     const readerHtml = await reader.text();
-    expect(readerHtml).toContain("aren't on the reviewer list");
+    expect(readerHtml).toContain("aren't on this repo's reviewer list");
     const ryan = await SELF.fetch('https://dub.test/r/o/r/pull/1', { headers: { accept: 'text/html', cookie: await cookieFor('ryan') } });
     const html = await ryan.text();
     expect(html).toContain('Send a reminder when an invoice is 7 days overdue');
@@ -376,6 +376,13 @@ describe('verdicts', () => {
     expect((await post(await cookieFor('ryan'), { idempotency_key: 'not-a-uuid' })).status).toBe(400);
     expect((await post(await cookieFor('ryan'), { bundle_id: BUNDLE_2 })).status).toBe(422);
     expect(gh.of('POST', '/repos/o/r/pulls/1/reviews')).toHaveLength(0);
+  });
+
+  it('treats a repo admin as a reviewer without being listed', async () => {
+    await upload(bundle());
+    const page = await (await SELF.fetch('https://dub.test/r/o/r/pull/1', { headers: { accept: 'text/html', cookie: await cookieFor('boss') } })).text();
+    expect(page).toContain('<form id="verdict" >');
+    expect((await post(await cookieFor('boss'))).status).toBe(201);
   });
 
   it('lets the author review their own PR when the repo allows self review', async () => {

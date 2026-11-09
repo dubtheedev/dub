@@ -49,6 +49,7 @@ The Missive workflow already has a workflow-level concurrency group; it stays.
 | 27 | **"Run checks again" re-runs the capture workflow.** `POST /api/reruns` finds the newest completed `pull_request` run of the publishing workflow on the bundle's head SHA and asks GitHub to re-run it; the page then polls `/api/prs/…` and reloads when a newer complete bundle for that SHA arrives. Needs the App permission **Actions: R/W**; without it GitHub answers 403 and the page says which permission is missing. Reviewers only. |
 | 28 | **`allow_self_review: true` in `.dub/config.yml` lets the PR author record the verdict.** Off by default; on for dogfooding a repo where one person writes the briefs and reviews them. |
 | 29 | **A PR without a brief is not a Dub PR.** On `opened`, `synchronize` and `reopened` the Worker lists `.dub/briefs/` at the head SHA; when there is no `*.md` there it records the head but writes no pending `dubbed` and no sticky comment, so a plain human PR never shows a status that cannot resolve. A later push that adds a brief, or a bundle arriving, turns the PR into a Dub PR as before. If the check itself fails the Worker assumes a brief. |
+| 30 | **Repo admins are always reviewers.** `reviewers:` grants the verdict to people with write access; anyone with admin on the repo has it without being listed, since they could edit the list anyway. The page tells a non-reviewer why the controls are hidden. |
 
 ## Layout of this repo
 
@@ -161,7 +162,7 @@ Permissions: Pull requests R/W, Commit statuses R/W, Contents R (rubric, PR crea
 ## Repo config (`.dub/config.yml` on the base branch)
 
 ```yaml
-reviewers: [ryanwsnow]      # GitHub logins allowed to write dubbed
+reviewers: [ryanwsnow]      # GitHub logins allowed to write dubbed (repo admins always can)
 base: main
 preview_origin_allowlist: [https://dubthee.dev]
 close_on_reject: true       # a Reject closes the PR (default); false records it only

@@ -309,7 +309,7 @@ ${s.worth_a_look?.length ? `<h2>Worth a look</h2><ul>${s.worth_a_look.map((w) =>
     <div class="row"><span class="muted">Also used (any):</span> ${checks('used', USED_OPTIONS)}</div>
     <div class="row"><span class="muted">Because (any):</span> ${checks('because', BECAUSE_OPTIONS)}</div>
   </form>
-  ${d.can_review ? '' : `<div class="muted">You can read this bundle but aren't on the reviewer list for this repo, so the verdict controls are hidden.</div>`}
+  ${d.can_review ? '' : `<div class="muted">You can read this bundle but aren't on this repo's reviewer list (or an admin of it), so the verdict controls are hidden.</div>`}
   <div id="result" aria-live="polite"></div>
 </footer>
 <script>

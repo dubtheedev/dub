@@ -467,6 +467,17 @@ export function servingHeaders(name: string): Record<string, string> {
 
 // ---- serving ---------------------------------------------------------------
 
+/**
+ * Who may record a verdict: anyone on the reviewer list with write access,
+ * and every repo admin whether listed or not. Admins can edit the list
+ * anyway, and it lets the person setting Dub up see the controls before the
+ * config PR lands (decision 30).
+ */
+function isReviewer(perm: Permission, config: DubConfig, login: string): boolean {
+  if (!atLeast(perm, 'write')) return false;
+  return perm === 'admin' || config.reviewers.includes(login.toLowerCase());
+}
+
 /** The author may not review their own PR unless the repo opts in for dogfooding. */
 function isOwnPR(config: DubConfig, author: string | null | undefined, login: string): boolean {
   if (config.allow_self_review) return false;
@@ -535,9 +546,9 @@ async function rerun(req: Request, env: Env): Promise<Response> {
   for (const k of ['owner', 'repo', 'pr', 'sha'] as const) if (!body[k]) throw new HttpError(400, `${k} required`);
   if (!/^[0-9a-f]{40}$/i.test(String(body.sha))) throw new HttpError(400, 'sha must be a full commit SHA');
   const id: PRId = { owner: body.owner!, repo: body.repo!, number: Number(body.pr) };
-  await requirePermission(env, user, id, 'write');
+  const perm = await requirePermission(env, user, id, 'write');
   const { config } = await repoConfig(env, id);
-  if (!config.reviewers.includes(user.login.toLowerCase())) throw new HttpError(403, `@${user.login} is not in .dub/config.yml reviewers`);
+  if (!isReviewer(perm, config, user.login)) throw new HttpError(403, `@${user.login} is not in .dub/config.yml reviewers and not a repo admin`);
 
   const tok = await app(env).installationToken(id.owner, id.repo);
   const runs = (await gh.workflowRuns(tok, id.owner, id.repo, { event: 'pull_request', head_sha: body.sha! }))
@@ -598,7 +609,7 @@ async function reviewPage(req: Request, env: Env, id: PRId, sha: string | null):
   if (!loaded) return renderSimple('Bundle missing', '<p>The bundle is recorded but its files are missing from storage.</p>', 500);
   const { config } = await repoConfig(env, id);
   const effective = state.verdicts.filter((v) => v.sha === pick.sha).sort((a, b) => b.seq - a.seq)[0] ?? null;
-  const can_review = atLeast(perm, 'write') && config.reviewers.includes(user.login.toLowerCase()) && !isOwnPR(config, state.pr.author, user.login);
+  const can_review = isReviewer(perm, config, user.login) && !isOwnPR(config, state.pr.author, user.login);
   const summary = env.ANTHROPIC_API_KEY ? await loadSummary(env, id, pick.sha, pick.bundle_id) : null;
   const html = renderReviewPage({
     owner: id.owner,
@@ -683,7 +694,7 @@ async function submitVerdict(req: Request, env: Env): Promise<Response> {
   // Authority: write access, on the reviewer list, and never the PR author.
   const perm = await requirePermission(env, user, id, 'write');
   const { config } = await repoConfig(env, id);
-  if (!config.reviewers.includes(user.login.toLowerCase())) throw new HttpError(403, `@${user.login} is not in .dub/config.yml reviewers`);
+  if (!isReviewer(perm, config, user.login)) throw new HttpError(403, `@${user.login} is not in .dub/config.yml reviewers and not a repo admin`);
   const stub = doFor(env, id);
   let state = await stub.state(id);
   if (!state.pr.author || !state.pr.head_sha) {
