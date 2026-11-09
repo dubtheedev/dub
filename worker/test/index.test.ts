@@ -370,6 +370,9 @@ describe('verdicts', () => {
     const author = await post(await cookieFor('agent-app[bot]'));
     expect(author.status).toBe(403);
     expect(((await author.json()) as { error: string }).error).toMatch(/author/);
+    const authorPage = await (await SELF.fetch('https://dub.test/r/o/r/pull/1', { headers: { accept: 'text/html', cookie: await cookieFor('agent-app[bot]') } })).text();
+    expect(authorPage).toContain('You opened this PR, and this repo does not allow self review');
+    expect(authorPage).not.toContain('<form id="verdict" >');
     expect((await post(await cookieFor('ryan'), {}, { origin: 'https://evil.example' })).status).toBe(403);
     expect((await post(await cookieFor('ryan'), { verdict: 'approve' })).status).toBe(400);
     expect((await post(await cookieFor('ryan'), { idempotency_key: undefined })).status).toBe(400);

@@ -13,6 +13,8 @@ export interface ReviewPageData {
   number: number;
   viewer: string;
   can_review: boolean;
+  /** Why the controls are hidden, shown in the footer; null when they are not. */
+  cannot_review_because: string | null;
   head_sha: string | null;
   bundle: Bundle;
   meta: Meta;
@@ -309,7 +311,7 @@ ${s.worth_a_look?.length ? `<h2>Worth a look</h2><ul>${s.worth_a_look.map((w) =>
     <div class="row"><span class="muted">Also used (any):</span> ${checks('used', USED_OPTIONS)}</div>
     <div class="row"><span class="muted">Because (any):</span> ${checks('because', BECAUSE_OPTIONS)}</div>
   </form>
-  ${d.can_review ? '' : `<div class="muted">You can read this bundle but aren't on this repo's reviewer list (or an admin of it), so the verdict controls are hidden.</div>`}
+  ${d.can_review ? '' : `<div class="muted">${inline(d.cannot_review_because ?? 'The verdict controls are hidden.')}</div>`}
   <div id="result" aria-live="polite"></div>
 </footer>
 <script>

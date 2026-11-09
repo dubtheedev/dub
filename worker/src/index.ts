@@ -609,7 +609,10 @@ async function reviewPage(req: Request, env: Env, id: PRId, sha: string | null):
   if (!loaded) return renderSimple('Bundle missing', '<p>The bundle is recorded but its files are missing from storage.</p>', 500);
   const { config } = await repoConfig(env, id);
   const effective = state.verdicts.filter((v) => v.sha === pick.sha).sort((a, b) => b.seq - a.seq)[0] ?? null;
-  const can_review = isReviewer(perm, config, user.login) && !isOwnPR(config, state.pr.author, user.login);
+  const reviewer = isReviewer(perm, config, user.login);
+  const own = isOwnPR(config, state.pr.author, user.login);
+  const can_review = reviewer && !own;
+  const cannot_review_because = can_review ? null : !reviewer ? ("You can read this bundle but aren't on this repo's reviewer list (or an admin of it), so the verdict controls are hidden." as const) : ('You opened this PR, and this repo does not allow self review (`allow_self_review` in `.dub/config.yml`), so the verdict controls are hidden.' as const);
   const summary = env.ANTHROPIC_API_KEY ? await loadSummary(env, id, pick.sha, pick.bundle_id) : null;
   const html = renderReviewPage({
     owner: id.owner,
@@ -617,6 +620,7 @@ async function reviewPage(req: Request, env: Env, id: PRId, sha: string | null):
     number: id.number,
     viewer: user.login,
     can_review,
+    cannot_review_because,
     head_sha: state.pr.head_sha,
     bundle: loaded.bundle,
     meta: loaded.meta,
