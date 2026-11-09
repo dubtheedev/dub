@@ -139,6 +139,15 @@ func cmdPack(args []string) error {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "brief %s (%d criteria), HEAD %s\n", b.ID, len(b.Criteria), short(head))
+	specs, err := bundle.SpecsFor(root, b.ID)
+	if err != nil {
+		return err
+	}
+	if len(specs) == 0 {
+		fmt.Fprintf(os.Stderr, "no specs for this brief (.dub/evidence/%s.spec.ts or .dub/evidence/%s/); every criterion will be none\n", b.ID, b.ID)
+	} else {
+		fmt.Fprintf(os.Stderr, "specs: %s\n", strings.Join(specs, ", "))
+	}
 
 	// 2. Warm the preview and pin its SHA.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
@@ -167,7 +176,7 @@ func cmdPack(args []string) error {
 		img = runner.DefaultImage
 	}
 	fmt.Fprintf(os.Stderr, "running %s (workers: 1) …\n", img)
-	res, err := runner.Default.Run(runner.Options{Repo: root, Out: runOut, PreviewURL: *previewURL, SHA: head, Criteria: crit, Image: img})
+	res, err := runner.Default.Run(runner.Options{Repo: root, Out: runOut, PreviewURL: *previewURL, SHA: head, Criteria: crit, Image: img, Specs: specs})
 	if err != nil {
 		return err
 	}
@@ -195,6 +204,7 @@ func cmdPack(args []string) error {
 		Repo: root, Base: *base, RepoName: *repoName, PR: *prNum, SHA: head, Runner: digest,
 		Preview:   bundle.Preview{URL: *previewURL, PreviewSHA: before, Moved: moved},
 		Brief:     b,
+		Specs:     specs,
 		Outcomes:  outcomes,
 		RunnerOut: runOut, BundleOut: *out,
 	})

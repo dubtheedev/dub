@@ -60,6 +60,7 @@ func TestAssemble(t *testing.T) {
 	bb, err := Assemble(Inputs{
 		Repo: repo, Base: "main", RepoName: "o/r", PR: 7, SHA: "abc", Runner: "img@sha256:1",
 		Preview: Preview{URL: "http://p", PreviewSHA: "abc"},
+		Specs:   []string{".dub/evidence/x.spec.ts"},
 		Brief:   b,
 		Outcomes: map[string]runner.Outcome{
 			"ac-1": {Status: "pass", Steps: []string{"goto /"}, Attachments: []runner.Attachment{{Name: "list", Path: "ac-1/list.png", ContentType: "image/png"}}},
@@ -152,5 +153,31 @@ func TestTestTitles(t *testing.T) {
 	got := testTitles("test('a', x)\n test.describe('d', () => { test(\"b\") })\n mytest('no')\n test(`c`)\n")
 	if strings.Join(got, ",") != "a,b,c" {
 		t.Error(got)
+	}
+}
+
+func TestSpecsFor(t *testing.T) {
+	repo := t.TempDir()
+	for _, f := range []string{
+		".dub/evidence/x.spec.ts", ".dub/evidence/x.more.spec.ts", ".dub/evidence/x/deep.spec.ts",
+		".dub/evidence/xy.spec.ts", ".dub/evidence/y.spec.ts", ".dub/evidence/helpers.ts", ".dub/evidence/x.helpers.ts",
+	} {
+		write(t, repo, f, "")
+	}
+	got, err := SpecsFor(repo, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{".dub/evidence/x.more.spec.ts", ".dub/evidence/x.spec.ts", ".dub/evidence/x/deep.spec.ts"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("got %v want %v", got, want)
+	}
+	none, err := SpecsFor(repo, "z")
+	if err != nil || none == nil || len(none) != 0 {
+		t.Errorf("z: %v %v", none, err)
+	}
+	empty, err := SpecsFor(t.TempDir(), "x")
+	if err != nil || empty == nil || len(empty) != 0 {
+		t.Errorf("no evidence dir: %v %v", empty, err)
 	}
 }

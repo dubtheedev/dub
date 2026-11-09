@@ -50,6 +50,7 @@ The Missive workflow already has a workflow-level concurrency group; it stays.
 | 28 | **`allow_self_review: true` in `.dub/config.yml` lets the PR author record the verdict.** Off by default; on for dogfooding a repo where one person writes the briefs and reviews them. |
 | 29 | **A PR that brings no brief is not a Dub PR.** On `opened`, `synchronize` and `reopened` the Worker reads the PR's file list; when it adds or changes no `.dub/briefs/*.md` it records the head but writes no pending `dubbed` and no sticky comment, so a plain human PR never shows a status that cannot resolve. Briefs that merged earlier sit on the base branch and do not count; this is the same rule `dub pack` uses to pick the brief, and the review-app workflow gates its Dub steps on the same diff. A later push that adds a brief, or a bundle arriving, turns the PR into a Dub PR as before. If the check itself fails the Worker assumes a brief. |
 | 30 | **Repo admins are always reviewers.** `reviewers:` grants the verdict to people with write access; anyone with admin on the repo has it without being listed, since they could edit the list anyway. The page tells a non-reviewer why the controls are hidden. |
+| 31 | **Only the brief's own specs run.** The runner image executes every `*.spec.ts` it is shown and results are matched to criteria by test title alone, so two briefs that both named a criterion `ac-1` would grade each other once the first merged. `dub pack` now mounts a staged copy of `.dub/` that holds only the spec files belonging to the brief: `.dub/evidence/<slug>.spec.ts`, `.dub/evidence/<slug>.<anything>.spec.ts` and anything under `.dub/evidence/<slug>/`. Files that are not specs (helpers) are shared and always present. A brief with no spec files runs nothing and every criterion is `none`. Criterion ids therefore need to be unique within a brief, not across the repo; `ac-1` in every brief is fine. |
 
 ## Layout of this repo
 
@@ -81,15 +82,15 @@ Front matter `id` (required, equals the slug), optional `issue`. First `#` headi
 
 Kinds: `visual | behaviour | check | judgment`. Ids match `^[a-z][a-z0-9-]*$` and are never reused or renumbered. `dub pack` refuses a brief with zero criteria, a duplicate id, or an unknown kind.
 
-## Evidence specs (`.dub/evidence/*.spec.ts`)
+## Evidence specs (`.dub/evidence/<slug>.spec.ts`)
 
-One `test('<criterion id>', …)` per criterion. Title is the id exactly. Specs import `test` and `expect` from **`@dub/test`** (never `@playwright/test` directly): the runner image provides it as Playwright's `test`/`expect` extended with an auto fixture that checks `x-dub-sha` on every document response. Specs may import relative modules under `.dub/`. Fixtures are in the spec, idempotent and safe from a half-mutated state; a clean slate is `/dev/reset` in `beforeAll`. Judgment criteria may have a spec for *supporting* artifacts but it must not `expect` anything.
+A brief's specs are `.dub/evidence/<slug>.spec.ts`, `.dub/evidence/<slug>.<anything>.spec.ts` and any `*.spec.ts` under `.dub/evidence/<slug>/`; nothing else runs for it (decision 31). One `test('<criterion id>', …)` per criterion. Title is the id exactly. Specs import `test` and `expect` from **`@dub/test`** (never `@playwright/test` directly): the runner image provides it as Playwright's `test`/`expect` extended with an auto fixture that checks `x-dub-sha` on every document response. Specs may import relative modules under `.dub/`. Fixtures are in the spec, idempotent and safe from a half-mutated state; a clean slate is `/dev/reset` in `beforeAll`. Judgment criteria may have a spec for *supporting* artifacts but it must not `expect` anything.
 
 ## Runner interface (`ghcr.io/dubtheedev/runner`)
 
 ```
 docker run --rm \
-  -v <repo>/.dub:/work/.dub:ro \
+  -v <staged copy of repo/.dub, holding only the brief's spec files>:/work/.dub:ro \
   -v <out>:/out \
   -e DUB_PREVIEW_URL=https://pr-87-misiva.fly.dev \
   -e DUB_SHA=<head sha> \

@@ -58,7 +58,10 @@ Rules:
 
 One `test('<criterion id>', …)` per criterion. The title **is** the id. Import
 from `@dub/test`, never `@playwright/test`; the runner provides it, the repo
-installs nothing.
+installs nothing. Only this brief's spec files run: `<slug>.spec.ts`,
+`<slug>.<anything>.spec.ts`, or anything under `evidence/<slug>/`. Other
+briefs' specs are ignored, so `ac-1` is fine even when an older brief used it.
+Helpers (`.ts` files that are not specs) are shared with every brief.
 
 ```ts
 import { test, expect } from '@dub/test';

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -107,6 +108,7 @@ type Inputs struct {
 	Runner    string // image digest
 	Preview   Preview
 	Brief     *brief.Brief
+	Specs     []string // the brief's spec files, repo-relative, from SpecsFor
 	Outcomes  map[string]runner.Outcome
 	RunnerOut string // the dir that was mounted at /out
 	BundleOut string // where to write dub.json and evidence/
@@ -188,7 +190,7 @@ func Assemble(in Inputs) (*Bundle, error) {
 	}
 	b.Diff = diffSummary(changed, loadAreas(in.Repo))
 
-	specs, err := specsByID(in.Repo)
+	specs, err := specsByID(in.Repo, in.Specs)
 	if err != nil {
 		return nil, err
 	}
@@ -284,13 +286,49 @@ func copyHash(src, dst string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// SpecsFor lists the spec files that belong to the brief `slug`:
+// .dub/evidence/<slug>.spec.ts, .dub/evidence/<slug>.<anything>.spec.ts and
+// every *.spec.ts under .dub/evidence/<slug>/. Other briefs' specs are left
+// alone, which is what lets two briefs both call a criterion ac-1. Files that
+// are not specs (helpers) are shared and never filtered. Paths come back
+// repo-relative with forward slashes, sorted; never nil.
+func SpecsFor(repo, slug string) ([]string, error) {
+	root := filepath.Join(repo, ".dub", "evidence")
+	out := []string{}
+	if _, err := os.Stat(root); err != nil {
+		if os.IsNotExist(err) {
+			return out, nil
+		}
+		return nil, err
+	}
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(p, ".spec.ts") {
+			return nil
+		}
+		rel, _ := filepath.Rel(root, p)
+		rel = filepath.ToSlash(rel)
+		if rel == slug+".spec.ts" || strings.HasPrefix(rel, slug+".") || strings.HasPrefix(rel, slug+"/") {
+			r, _ := filepath.Rel(repo, p)
+			out = append(out, filepath.ToSlash(r))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 // specsByID maps criterion id → spec path by scanning test('<id>' titles in
-// .dub/evidence/*.spec.ts.
-func specsByID(repo string) (map[string]string, error) {
+// the brief's own spec files (see SpecsFor).
+func specsByID(repo string, specs []string) (map[string]string, error) {
 	m := map[string]string{}
-	paths, _ := filepath.Glob(filepath.Join(repo, ".dub", "evidence", "*.spec.ts"))
-	sort.Strings(paths)
-	for _, p := range paths {
+	for _, rel := range specs {
+		p := filepath.Join(repo, filepath.FromSlash(rel))
 		data, err := os.ReadFile(p)
 		if err != nil {
 			return nil, err

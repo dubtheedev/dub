@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,6 +31,9 @@ type Options struct {
 	Criteria   []Criterion
 	Image      string
 	Stderr     *os.File
+	// Specs are the brief's own spec files, repo-relative (bundle.SpecsFor).
+	// nil runs everything under .dub/evidence; an empty list runs nothing.
+	Specs []string
 }
 
 // Attachment is one artifact the runner wrote under /out/<id>/.
@@ -102,9 +106,23 @@ func (r *Runner) Run(o Options) (*Results, error) {
 	if err := os.MkdirAll(outAbs, 0o755); err != nil {
 		return nil, err
 	}
+	dubDir := filepath.Join(repoAbs, ".dub")
+	if o.Specs != nil {
+		if len(o.Specs) == 0 {
+			// Nothing to run: every criterion is `none`. Playwright would exit
+			// without writing results.json on "no tests found".
+			return &Results{}, nil
+		}
+		staged, err := stage(repoAbs, o.Specs)
+		if err != nil {
+			return nil, err
+		}
+		defer os.RemoveAll(staged)
+		dubDir = staged
+	}
 	crit, _ := json.Marshal(o.Criteria)
 	args := []string{"run", "--rm",
-		"-v", filepath.Join(repoAbs, ".dub") + ":/work/.dub:ro",
+		"-v", dubDir + ":/work/.dub:ro",
 		"-v", outAbs + ":/out",
 		"-e", "DUB_PREVIEW_URL=" + o.PreviewURL,
 		"-e", "DUB_SHA=" + o.SHA,
@@ -178,4 +196,43 @@ func CheckDocker() error {
 		return ErrNoDocker
 	}
 	return nil
+}
+
+// stage copies <repo>/.dub to a temp dir, leaving out every *.spec.ts that is
+// not one of specs, so the image (which runs every spec it can see) runs only
+// the brief's own. Everything that is not a spec file is copied as is.
+func stage(repoAbs string, specs []string) (string, error) {
+	keep := map[string]bool{}
+	for _, s := range specs {
+		keep[filepath.ToSlash(s)] = true
+	}
+	src := filepath.Join(repoAbs, ".dub")
+	dst, err := os.MkdirTemp("", "dub-stage-")
+	if err != nil {
+		return "", err
+	}
+	err = filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(repoAbs, p)
+		rel = filepath.ToSlash(rel)
+		target := filepath.Join(dst, filepath.FromSlash(strings.TrimPrefix(rel, ".dub")))
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		if strings.HasSuffix(rel, ".spec.ts") && !keep[rel] {
+			return nil
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, 0o644)
+	})
+	if err != nil {
+		os.RemoveAll(dst)
+		return "", err
+	}
+	return dst, nil
 }

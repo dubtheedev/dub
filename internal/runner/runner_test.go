@@ -1,8 +1,10 @@
 package runner
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -65,5 +67,56 @@ func TestDigestFallback(t *testing.T) {
 	r = &Runner{Exec: func(string, ...string) ([]byte, error) { return []byte("img@sha256:abc\n"), nil }}
 	if d, ok := r.Digest("img:latest"); !ok || d != "img@sha256:abc" {
 		t.Error(d, ok)
+	}
+}
+
+func TestRunStagesOnlyTheBriefSpecs(t *testing.T) {
+	repo := t.TempDir()
+	for name, body := range map[string]string{
+		".dub/config.yml":           "base: main\n",
+		".dub/evidence/helpers.ts":  "export const a = 1\n",
+		".dub/evidence/a.spec.ts":   "test('ac-1', () => {})\n",
+		".dub/evidence/b.spec.ts":   "test('ac-1', () => {})\n",
+		".dub/evidence/b/c.spec.ts": "test('ac-2', () => {})\n",
+		".dub/evidence/b/helper.ts": "export const b = 2\n",
+	} {
+		p := filepath.Join(repo, filepath.FromSlash(name))
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		os.WriteFile(p, []byte(body), 0o644)
+	}
+	out := t.TempDir()
+	var seen []string
+	r := &Runner{Exec: func(name string, args ...string) ([]byte, error) {
+		for _, a := range args {
+			if strings.HasSuffix(a, ":/work/.dub:ro") {
+				root := strings.TrimSuffix(a, ":/work/.dub:ro")
+				filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+					if err == nil && !d.IsDir() {
+						rel, _ := filepath.Rel(root, p)
+						seen = append(seen, filepath.ToSlash(rel))
+					}
+					return nil
+				})
+			}
+		}
+		os.WriteFile(filepath.Join(out, "results.json"), []byte(`{"preview_moved":false,"tests":[]}`), 0o644)
+		return nil, nil
+	}}
+	if _, err := r.Run(Options{Repo: repo, Out: out, Specs: []string{".dub/evidence/a.spec.ts"}}); err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(seen)
+	want := "config.yml,evidence/a.spec.ts,evidence/b/helper.ts,evidence/helpers.ts"
+	if got := strings.Join(seen, ","); got != want {
+		t.Errorf("staged %q, want %q", got, want)
+	}
+}
+
+func TestRunWithNoSpecsSkipsDocker(t *testing.T) {
+	called := false
+	r := &Runner{Exec: func(name string, args ...string) ([]byte, error) { called = true; return nil, nil }}
+	res, err := r.Run(Options{Repo: t.TempDir(), Out: t.TempDir(), Specs: []string{}})
+	if err != nil || called || len(res.Tests) != 0 {
+		t.Errorf("err=%v called=%v res=%+v", err, called, res)
 	}
 }
