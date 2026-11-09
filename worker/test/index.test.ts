@@ -190,7 +190,7 @@ describe('review page and API', () => {
     const reader = await SELF.fetch('https://dub.test/r/o/r/pull/1', { headers: { accept: 'text/html', cookie: await cookieFor('reader') } });
     expect(reader.status).toBe(200);
     const readerHtml = await reader.text();
-    expect(readerHtml).toContain("aren't on this repo's reviewer list");
+    expect(readerHtml).toContain('aren&#39;t on this repo&#39;s reviewer list');
     const ryan = await SELF.fetch('https://dub.test/r/o/r/pull/1', { headers: { accept: 'text/html', cookie: await cookieFor('ryan') } });
     const html = await ryan.text();
     expect(html).toContain('Send a reminder when an invoice is 7 days overdue');
