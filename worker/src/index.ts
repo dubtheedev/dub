@@ -266,13 +266,15 @@ async function webhook(req: Request, env: Env): Promise<Response> {
   };
   if (!['opened', 'synchronize', 'reopened', 'closed'].includes(body.action)) return new Response(null, { status: 204 });
   const id: PRId = { owner: body.repository.owner.login, repo: body.repository.name, number: body.number };
-  // A PR without a brief is not a Dub PR; it gets no pending status to wait on.
+  // A PR that adds or changes no brief is not a Dub PR; it gets no pending
+  // status to wait on. Briefs that merged earlier sit on the base branch, so
+  // the test is the PR's own diff, the same rule `dub pack` uses.
   let has_brief: boolean | undefined;
   if (body.action !== 'closed') {
     try {
       const tok = await app(env).installationToken(id.owner, id.repo);
-      const names = await gh.listDir(tok, id.owner, id.repo, '.dub/briefs', body.pull_request.head.sha);
-      has_brief = (names ?? []).some((n) => n.endsWith('.md'));
+      const files = await gh.prFiles(tok, id.owner, id.repo, id.number);
+      has_brief = files.some((f) => /^\.dub\/briefs\/[^/]+\.md$/.test(f.filename) && f.status !== 'removed');
     } catch (e) {
       console.error('brief check failed, assuming a brief', e);
     }

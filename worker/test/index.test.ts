@@ -75,8 +75,9 @@ describe('webhooks', () => {
     expect(other.status).toBe(204);
   });
 
-  it('leaves a PR without a brief alone: no pending status, no sticky comment', async () => {
-    gh.on('GET /repos/o/r/contents/.dub/briefs', () => ({ status: 404, body: { message: 'Not Found' } }));
+  it('leaves a PR that changes no brief alone: no pending status, no sticky comment', async () => {
+    // A brief merged earlier lives on main; this PR only touches code.
+    gh.on('GET /repos/o/r/pulls/1/files', () => ({ body: [{ filename: 'lib/invoices.ex', status: 'modified', additions: 1, deletions: 1 }] }));
     const payload = JSON.stringify({ action: 'opened', number: 1, repository: { name: 'r', owner: { login: 'o' } }, pull_request: { head: { sha: SHA_B }, user: { login: 'human' }, state: 'open' } });
     const sig = 'sha256=' + (await hmacHex(env.GITHUB_WEBHOOK_SECRET, new TextEncoder().encode(payload)));
     const ok = await SELF.fetch('https://dub.test/webhooks/github', { method: 'POST', headers: { 'x-github-event': 'pull_request', 'x-hub-signature-256': sig }, body: payload });
